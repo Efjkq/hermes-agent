@@ -6713,12 +6713,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         _clear_turn_process_ownership(agent)
                     clear_session_vars(tokens)
 
+        # `_run_agent` is the shared point reached by every synchronous and
+        # streaming API agent path.  Acquire before scheduling the executor so
+        # no provider/tool work can begin without the supervisor's fenced
+        # platform lease.  Outside hosted lifecycle mode this is an inert
+        # no-op and preserves the ordinary API behaviour.
+        from gateway.platform_activity import begin_platform_activity
+
+        platform_activity_lease = await begin_platform_activity()
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
             self._inflight_agent_runs -= 1
+            try:
+                await platform_activity_lease.finish()
+            except Exception as exc:
+                logger.warning("Failed to finish platform API activity lease: %s", exc)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -6974,6 +6986,12 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            # `/v1/runs` owns a separate executor lifecycle and does not call
+            # `_run_agent`; acquire before it creates its first agent so this
+            # asynchronous API surface has the same pre-admission guarantee.
+            from gateway.platform_activity import begin_platform_activity
+
+            platform_activity_lease = await begin_platform_activity()
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -7223,6 +7241,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                try:
+                    await platform_activity_lease.finish()
+                except Exception as exc:
+                    logger.warning("Failed to finish platform run activity lease: %s", exc)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())

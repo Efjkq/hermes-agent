@@ -15799,6 +15799,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "please resend shortly."
             )
 
+        # Hosted Hermes must acquire the platform residency lease before it
+        # admits a user turn.  The supervisor owns the heartbeat and the
+        # platform fences stale owners; this runtime only brackets actual
+        # gateway work.  Ordinary Deployments have no configured socket, so
+        # `begin_platform_activity` is an inert no-op for their existing path.
+        try:
+            from gateway.platform_activity import PlatformActivityError, begin_platform_activity
+
+            _platform_activity_lease = await begin_platform_activity()
+        except PlatformActivityError as exc:
+            logger.warning("Refusing new turn: platform activity lease unavailable: %s", exc)
+            return (
+                "⏳ This agent is preparing its runtime and cannot accept a new turn yet. "
+                "Please resend shortly."
+            )
+
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
         # are numerous await points (hooks, vision enrichment, STT,
@@ -15811,6 +15827,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source,
         )
         if _limit_message is not None:
+            try:
+                await _platform_activity_lease.finish()
+            except PlatformActivityError as exc:
+                logger.warning("Failed to finish unused platform activity lease: %s", exc)
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
@@ -15878,6 +15898,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                await _platform_activity_lease.finish()
+            except PlatformActivityError as exc:
+                # The supervisor will stop heartbeats after the stream loss and
+                # the platform expiry path owns recovery. Never let a failed
+                # terminal report mask the user's completed/cancelled result.
+                logger.warning("Failed to finish platform activity lease: %s", exc)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.

@@ -52,6 +52,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -127,7 +128,18 @@ def current_instantiation_epoch() -> str:
 
 
 def drain_request_path(home: Optional[Path] = None) -> Path:
-    """Absolute path to the drain-request marker, respecting HERMES_HOME."""
+    """Absolute path to the drain-request marker, respecting HERMES_HOME.
+
+    Hosted sandboxes provide a supervisor-owned, workload-read-only marker
+    directory. It keeps lifecycle authority out of tenant durable state while
+    retaining the established ``.drain_request.json`` protocol. Ordinary
+    deployments leave the override unset.
+    """
+    override = os.environ.get("HERMES_DRAIN_REQUEST_PATH", "").strip()
+    if override:
+        candidate = Path(override)
+        if candidate.is_absolute():
+            return candidate
     base = home if home is not None else get_hermes_home()
     return Path(base) / _DRAIN_REQUEST_FILENAME
 
