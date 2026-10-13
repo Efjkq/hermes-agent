@@ -218,11 +218,31 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. 'current' publishes to the current API conversation with its trusted context. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+            },
+            "reply_markup": {
+                "type": "object",
+                "description": "Optional Telegram-style inline_keyboard for target='current' in an API conversation. Each button has text and exactly one callback_data (1–64 UTF-8 bytes) or safe HTTP(S) url. Buttons reference host-registered actions; they do not execute commands.",
+                "properties": {
+                    "inline_keyboard": {
+                        "type": "array", "items": {"type": "array", "items": {
+                            "type": "object", "properties": {
+                                "text": {"type": "string"},
+                                "callback_data": {"type": "string"},
+                                "url": {"type": "string"},
+                                "style": {"type": "string", "enum": ["primary", "success", "danger"]}
+                            }, "required": ["text"], "additionalProperties": False
+                        }}
+                    }
+                }, "required": ["inline_keyboard"], "additionalProperties": False
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional host action proposals for current delivery (maximum 32KiB). This is untrusted data; only host-validated, registered actions can be confirmed. Never include credentials."
             },
             "emoji": {
                 "type": "string",
@@ -361,6 +381,12 @@ def _handle_send(args):
     message = args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
+
+    if target == "current":
+        from gateway.interactive_messages import send_current_message
+        return json.dumps(send_current_message(message, args.get("reply_markup"), args.get("metadata")), ensure_ascii=False)
+    if args.get("reply_markup") is not None:
+        return tool_error("Inline keyboard delivery is supported only for the current API conversation")
 
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()

@@ -375,3 +375,21 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
 
 
+
+
+def test_paper_factory_snapshot_survives_native_prologue_with_mcp_registered():
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.config import PlatformConfig
+    agent = _FakeAgent()
+    adapter = APIServerAdapter(PlatformConfig())
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key":"test-key","base_url":None,"provider":None,"api_mode":None,"command":None,"args":[]}), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch("gateway.run._load_gateway_config", return_value={}), patch("run_agent.AIAgent", return_value=agent):
+        adapter._create_agent(interactive_messages=True, proposal_only=True)
+    names = set(agent.valid_tool_names)
+    assert "send_message" in names
+    def broad_refresh(agent, **kwargs):
+        agent.tools = []
+        agent.valid_tool_names = {"tool_call", "terminal"}
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), patch("tools.mcp_tool.refresh_agent_mcp_tools", side_effect=broad_refresh):
+        _build(agent)
+    assert agent.valid_tool_names == names
+    assert "send_message" in {tool["function"]["name"] for tool in agent.tools}

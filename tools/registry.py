@@ -770,6 +770,10 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        from tools.execution_scope import execution_scope_error
+        blocked = execution_scope_error(name)
+        if blocked:
+            return blocked
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
