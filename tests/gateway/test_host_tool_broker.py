@@ -68,6 +68,37 @@ def test_timeout_reports_original_call_id_and_rejects_late_result():
     host.close()
 
 
+def test_timeout_is_inactive_before_pending_cleanup():
+    from gateway.host_tools import HostCallInactive
+    events = Queue()
+    host = broker(events, timeout=0.01)
+    result_attempts = []
+    class TimeoutInterleave:
+        """Force the late reply between the timeout and finally locks."""
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.interleaved = False
+        def __enter__(self):
+            self.lock.acquire()
+        def __exit__(self, *_):
+            self.lock.release()
+            if not self.interleaved and host._settled and host._pending:
+                self.interleaved = True
+                request = events.queue[0]
+                try:
+                    result_attempts.append(host.resolve(request["callId"], request["requestHash"], {"status":"ready"}))
+                except HostCallInactive:
+                    result_attempts.append("inactive")
+    host._lock = TimeoutInterleave()
+    outcome = host.call("prepare", {})
+    assert outcome["error"]["code"] == "HOST_CALL_UNKNOWN"
+    assert result_attempts == ["inactive"]
+    request = events.get_nowait()
+    with pytest.raises(HostCallInactive):
+        host.resolve(request["callId"], request["requestHash"], {"status":"ready"})
+    host.close()
+
+
 def test_two_read_slots_and_serial_preparation_are_released_on_stop():
     events = Queue()
     host = broker(events)

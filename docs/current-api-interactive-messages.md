@@ -34,7 +34,13 @@ those bytes for the digest. Legacy requests without it use canonical JSON. The a
 `POST /v1/runs/{run_id}/host-tools/{call_id}/result` with
 `{"requestHash":"...","result":{"status":"ready","data":{}}}`. Replies are bound
 to the original Run/profile/hash. Identical replies are idempotent while the Run
-broker exists; conflicts and late results fail. Requests are finite JSON objects
+broker exists; conflicts fail. An authenticated result for a known expired or
+stopped call returns HTTP 410 with `error.code=host_call_inactive` and is never
+delivered to the model. The host may retain its own outcome and drain the Run;
+this acknowledgement does not confirm execution. An unknown call remains 404,
+and a conflicting hash/result remains 409. Once the terminal Run's broker has
+been removed, the host must verify that Run's authenticated terminal status
+before treating a 404 result endpoint as drainable. Requests are finite JSON objects
 up to 8 KiB, results 32 KiB, deadline 15 seconds, two concurrent reads and one
 serialized preparation. Stop/shutdown release pending calls. Timeout returns the
 original call ID as `HOST_CALL_UNKNOWN`; the host must recover the original receipt
@@ -50,3 +56,11 @@ cache entry. Ordinary native Skill behavior is unchanged.
 Capabilities expose `host_tools_v1` and enabled `host_tool_names`. The bridge being
 present alone does not prove a platform plugin, backend service or real model is
 available. Those must be tested and versioned separately.
+
+Unbound ordinary/Live/News API runs remove `api_host_tools` even when an operator
+included it in configured toolsets. Only a validated Paper host binding can add
+its exact manifest. This keeps proxy schemas and their Skill dependencies out
+of normal conversation catalogues. Registry schema admission enforces the same
+boundary for `all/*`, raw tool-search catalogues and native messaging plugin
+discovery, including Telegram. Timeout marks a call inactive under the same
+lock that chooses its unknown outcome, before pending-call cleanup.

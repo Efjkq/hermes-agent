@@ -23,6 +23,10 @@ def _error(code, call_id=None):
             **({"callId": call_id} if call_id else {})}
 
 
+class HostCallInactive(LookupError):
+    """Known authenticated call finished; a late result must not reenter the model."""
+
+
 class HostToolBroker:
     def __init__(self, run_id, names, publish, *, serial_tools=(), timeout=15):
         self.run_id = run_id
@@ -73,13 +77,15 @@ class HostToolBroker:
             entry["event"].wait(timeout=max(0, self.timeout - (time.monotonic() - started)))
             with self._lock:
                 if entry["reply"] is None:
-                    self._settled[call_id] = {"hash": request_hash, "reply": None}
+                    entry["inactive"] = True
+                    self._settled[call_id] = {"hash": request_hash, "reply": None, "inactive": True}
                     return _error("HOST_CALL_UNKNOWN", call_id)
                 return deepcopy(entry["reply"])
         finally:
             with self._lock:
                 self._pending.pop(call_id, None)
-                self._settled.setdefault(call_id, {"hash": request_hash, "reply": entry["reply"]})
+                self._settled.setdefault(call_id, {"hash": request_hash, "reply": entry["reply"],
+                                                   "inactive": entry.get("inactive", False)})
             slot.release()
 
     def resolve(self, call_id, request_hash, reply):
@@ -91,13 +97,19 @@ class HostToolBroker:
             entry = self._pending.get(call_id)
             settled = self._settled.get(call_id)
             if entry is None:
-                if not settled or settled["reply"] is None:
+                if not settled:
                     raise LookupError("Host call is not pending")
-                if settled["hash"] != request_hash or settled["reply"] != normalized:
+                if settled["hash"] != request_hash:
+                    raise ValueError("Conflicting host result")
+                if settled["reply"] is None or settled.get("inactive", False):
+                    raise HostCallInactive("Host call is no longer active")
+                if settled["reply"] != normalized:
                     raise ValueError("Conflicting host result")
                 return False
-            if self._closed or entry["hash"] != request_hash:
+            if entry["hash"] != request_hash:
                 raise ValueError("Invalid host call result")
+            if self._closed or entry.get("inactive", False):
+                raise HostCallInactive("Host call is no longer active")
             if entry["reply"] is not None and entry["reply"] != normalized:
                 raise ValueError("Conflicting host result")
             entry["reply"] = normalized
@@ -110,6 +122,7 @@ class HostToolBroker:
             for call_id, entry in self._pending.items():
                 if entry["reply"] is None:
                     entry["reply"] = _error("HOST_CALL_CANCELLED", call_id)
+                    entry["inactive"] = True
                 entry["event"].set()
 
 

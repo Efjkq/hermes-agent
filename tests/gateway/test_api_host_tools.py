@@ -8,6 +8,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from tools.registry import registry
 from tests.gateway.test_api_server_interactive_messages import _interactive_app, context, settle
 from tests.gateway.test_api_server_runs import _make_adapter
+from hermes_cli.tools_config import _get_platform_tools as native_platform_tools
 
 
 @pytest.fixture
@@ -102,3 +103,76 @@ async def test_stop_releases_host_wait_without_native_or_channel_fallback(host_p
             assert agent.result["error"]["code"] == "HOST_CALL_CANCELLED"
             assert run_id not in adapter._run_host_tools
             stream.release()
+
+
+@pytest.mark.parametrize("configured", ["api_host_tools", "all", "*"])
+def test_unbound_api_turns_do_not_discover_configured_host_proxies(host_plugin, configured, monkeypatch):
+    from unittest.mock import MagicMock
+    from model_tools import get_tool_definitions
+    adapter = _make_adapter("test-key")
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *a: [configured, "api_host_tools", "skills"])
+    def construct(**kwargs):
+        agent = MagicMock()
+        agent.tools = get_tool_definitions(enabled_toolsets=kwargs["enabled_toolsets"],
+            quiet_mode=True, skip_tool_search_assembly=True)
+        return agent
+    with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key":"test-key",
+        "base_url":None, "provider":None, "api_mode":None, "command":None, "args":[]}), \
+        patch("gateway.run._resolve_gateway_model", return_value="test/model"), \
+        patch("gateway.run._load_gateway_config", return_value={}), \
+        patch("run_agent.AIAgent", side_effect=construct):
+        normal = adapter._create_agent()
+        interactive = adapter._create_agent(interactive_messages=True)
+        bound = adapter._create_agent(interactive_messages=True, proposal_only=True,
+            host_tool_names=[host_plugin])
+    for agent in (normal, interactive):
+        assert host_plugin not in {tool["function"]["name"] for tool in agent.tools}
+    assert host_plugin in bound.valid_tool_names
+
+
+def test_native_telegram_plugin_discovery_does_not_advertise_unbound_host_proxies(host_plugin, monkeypatch):
+    from model_tools import get_tool_definitions
+    monkeypatch.setattr("hermes_cli.tools_config._get_plugin_toolset_keys", lambda: {"api_host_tools"})
+    configured = native_platform_tools({}, "telegram")
+    # Exercise normal plugin auto-discovery rather than an API constructor.
+    assert "api_host_tools" in configured
+    definitions = get_tool_definitions(enabled_toolsets=configured,
+        quiet_mode=True, skip_tool_search_assembly=True)
+    names = {tool["function"]["name"] for tool in definitions}
+    assert host_plugin not in names
+    assert "skills_list" in names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", [False, True])
+async def test_finished_host_call_has_typed_nonexecution_acknowledgement(host_plugin, closed):
+    from queue import Queue
+    from concurrent.futures import ThreadPoolExecutor
+    from gateway.host_tools import HostToolBroker
+    adapter = _make_adapter("test-key")
+    headers = {"Authorization": "Bearer test-key"}
+    events = Queue()
+    broker = HostToolBroker("retained-run", {host_plugin}, events.put, timeout=0.05)
+    if closed:
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            pending = worker.submit(broker.call, host_plugin, {})
+            event = events.get(timeout=2)
+            broker.close()
+            original = pending.result(timeout=2)
+    else:
+        original = broker.call(host_plugin, {})
+        event = events.get_nowait()
+    adapter._run_host_tools["retained-run"] = broker
+    adapter._run_owners["retained-run"] = adapter._run_idempotency_scope(None)
+    route = f"/v1/runs/retained-run/host-tools/{event['callId']}/result"
+    body = {"requestHash":event["requestHash"], "result":{"status":"ready"}}
+    async with TestClient(TestServer(_interactive_app(adapter))) as client:
+        assert (await client.post(route, json=body)).status == 401
+        assert (await client.post(route, headers=headers, json={**body,"requestHash":"wrong"})).status == 409
+        assert (await client.post(route.replace(event["callId"],"unknown"), headers=headers,json=body)).status == 404
+        response = await client.post(route, headers=headers, json=body)
+        assert response.status == 410, await response.text()
+        assert (await response.json())["error"]["code"] == "host_call_inactive"
+        assert (await client.post(route, headers=headers, json=body)).status == 410
+    assert original["error"]["code"] == ("HOST_CALL_CANCELLED" if closed else "HOST_CALL_UNKNOWN")
+    broker.close()

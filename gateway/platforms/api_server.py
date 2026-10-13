@@ -2895,7 +2895,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        # Config enables plugin discovery, but host proxies only exist in an
+        # explicitly bound current Run. Ordinary/Live/News retain their tools.
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"api_host_tools"})
         if interactive_messages:
             enabled_toolsets = sorted(set(enabled_toolsets) | {"api_interactions"})
 
@@ -7976,8 +7978,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise ValueError("Invalid result")
         except (ValueError, TypeError, RecursionError):
             return web.json_response(_openai_error("Invalid host result"), status=400)
+        from gateway.host_tools import HostCallInactive
         try:
             broker.resolve(request.match_info["call_id"], body["requestHash"], body["result"])
+        except HostCallInactive:
+            return web.json_response(_openai_error("Call no longer active", code="host_call_inactive"), status=410)
         except LookupError:
             return web.json_response(_openai_error("Call no longer pending"), status=404)
         except (ValueError, TypeError, RecursionError):
