@@ -65,6 +65,7 @@ class HostToolBroker:
                 self.publish({
                     "event": "host_tool.request", "run_id": self.run_id,
                     "callId": call_id, "name": name, "arguments": json.loads(encoded),
+                    "argumentsJson": encoded,
                     "requestHash": request_hash, "deadline": time.time() + remaining,
                 })
             except Exception:

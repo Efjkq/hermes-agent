@@ -27,7 +27,10 @@ a configured API key. The exact owner/host tool scope participates in native sch
 caching, prompt construction and Skill dependency discovery.
 
 SSE `host_tool.request` contains `run_id`, `callId`, `name`, `arguments`,
-`requestHash` and an epoch-seconds `deadline`. The authenticated host responds to
+`argumentsJson`, `requestHash` and an epoch-seconds `deadline`. The compact UTF-8
+`argumentsJson` preserves the bytes hashed by the producer (including number
+spelling); the host verifies its parsed values match `arguments` before using
+those bytes for the digest. Legacy requests without it use canonical JSON. The authenticated host responds to
 `POST /v1/runs/{run_id}/host-tools/{call_id}/result` with
 `{"requestHash":"...","result":{"status":"ready","data":{}}}`. Replies are bound
 to the original Run/profile/hash. Identical replies are idempotent while the Run

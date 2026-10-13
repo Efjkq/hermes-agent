@@ -90,3 +90,18 @@ def test_unbound_plugin_call_never_falls_back_to_another_channel():
         result = call_current_host_tool("prepare", {})
     assert result["status"] == "error"
     assert events.empty()
+
+def test_host_preserves_number_bytes_for_a_json_consumer_with_integer_number_spelling():
+    import hashlib
+    events = Queue()
+    host = broker(events)
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        waiting = worker.submit(host.call, "facts", {"number": 50.0})
+        request = events.get(timeout=2)
+        host.close()
+        waiting.result(timeout=2)
+    # JavaScript parses 50.0 as 50. The original bytes must remain available
+    # to verify the same request digest rather than misrejecting valid inputs.
+    consumer_json = request.get("argumentsJson", '{"number":50}')
+    assert hashlib.sha256(("facts\n" + consumer_json).encode()).hexdigest() == request["requestHash"]
+    assert json.loads(consumer_json) == request["arguments"]
