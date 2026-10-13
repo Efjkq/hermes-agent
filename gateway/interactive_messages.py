@@ -57,9 +57,18 @@ class InteractionContext(BaseModel):
     market_key: Optional[str] = Field(default=None, min_length=1, max_length=512)
     context_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
     host_data: Optional[dict] = None
+    host_tools: list[str] = Field(default_factory=list, max_length=8)
+    serial_host_tools: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def bounded_host_data(self):
+        if self.host_tools or self.serial_host_tools:
+            if self.mode != "paper" or len(set(self.host_tools)) != len(self.host_tools):
+                raise ValueError("Host tools require a unique Paper manifest")
+            if any(not name.isidentifier() or len(name) > 64 for name in self.host_tools):
+                raise ValueError("Invalid host tool name")
+            if not set(self.serial_host_tools) <= set(self.host_tools):
+                raise ValueError("Unknown serialized host tool")
         if self.host_data is not None:
             encoded = json.dumps(self.host_data, allow_nan=False, ensure_ascii=False)
             if len(encoded.encode("utf-8")) > 32768:
@@ -74,11 +83,13 @@ _context: ContextVar[Optional[dict]] = ContextVar("current_interaction_context",
 
 
 @contextmanager
-def current_message_scope(deliver: Callable, context: Optional[dict] = None):
+def current_message_scope(deliver: Callable, context: Optional[dict] = None, *, available_tools=None):
     delivery_token = _delivery.set(deliver)
     context_token = _context.set(deepcopy(context))
     try:
-        with proposal_only_scope(bool(context and context.get("mode") == "paper")):
+        with proposal_only_scope(bool(context and context.get("mode") == "paper"),
+                                 host_tools=(context or {}).get("host_tools", ()),
+                                 available_tools=available_tools):
             yield
     finally:
         _context.reset(context_token)

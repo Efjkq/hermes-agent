@@ -13,3 +13,37 @@ Paper schemas are read before tool-search assembly so `send_message` remains vis
 Validation: `scripts/run_tests.sh tests/gateway/test_api_server_interactive_messages.py tests/gateway/test_api_server_native_runs.py tests/gateway/test_api_server_toolset.py tests/tools/test_send_message_react.py tests/tools/test_clarify_gateway.py -j 1 --file-retries 0`.
 
 Paper tool schemas are frozen for the Run and skip native between-turn MCP discovery. Vision/video tools remain unavailable until media sources can be bound to authenticated host input; normal Agent tool behavior is unchanged.
+
+## Current-Run host tools (v1)
+
+Platform plugins can register schemas in `api_host_tools`. They are proxies:
+registry dispatch uses only the current Run broker and never calls a local handler.
+Only tools enabled for the authenticated API platform can be admitted. Telegram,
+ordinary chat and Live do not gain a host binding. No proxy confirms transactions.
+
+`interaction_context.host_tools` is a unique list of at most eight registered names;
+`serial_host_tools` is a subset for preparation calls. These require Paper mode and
+a configured API key. The exact owner/host tool scope participates in native schema
+caching, prompt construction and Skill dependency discovery.
+
+SSE `host_tool.request` contains `run_id`, `callId`, `name`, `arguments`,
+`requestHash` and an epoch-seconds `deadline`. The authenticated host responds to
+`POST /v1/runs/{run_id}/host-tools/{call_id}/result` with
+`{"requestHash":"...","result":{"status":"ready","data":{}}}`. Replies are bound
+to the original Run/profile/hash. Identical replies are idempotent while the Run
+broker exists; conflicts and late results fail. Requests are finite JSON objects
+up to 8 KiB, results 32 KiB, deadline 15 seconds, two concurrent reads and one
+serialized preparation. Stop/shutdown release pending calls. Timeout returns the
+original call ID as `HOST_CALL_UNKNOWN`; the host must recover the original receipt
+rather than issue a new financial command. A gateway restart interrupts the Run;
+it does not replay the model or recreate a call automatically.
+
+Paper native `skill_view` preserves normal verification, disabled-Skill checks and
+safe path-template substitution. It exposes only `SKILL.md` and Markdown references,
+never inline shell processing, environment passthrough or credential preparation.
+Repeated views recheck restricted policy instead of returning an old permission
+cache entry. Ordinary native Skill behavior is unchanged.
+
+Capabilities expose `host_tools_v1` and enabled `host_tool_names`. The bridge being
+present alone does not prove a platform plugin, backend service or real model is
+available. Those must be tested and versioned separately.

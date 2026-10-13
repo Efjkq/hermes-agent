@@ -1466,6 +1466,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_idempotency_store = RunIdempotencyStore()
         self._run_idempotency_ids: set[str] = set()
         self._run_owners: Dict[str, str] = {}
+        self._run_host_tools: Dict[str, Any] = {}
         self._run_owner_pid = os.getpid()
         try:
             from gateway.status import get_process_start_time
@@ -2103,6 +2104,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
+            ("POST", "/v1/runs/{run_id}/host-tools/{call_id}/result", self._handle_host_tool_result),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2620,6 +2622,7 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         interactive_messages: bool = False,
         proposal_only: bool = False,
+        host_tool_names: tuple[str, ...] = (),
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2901,6 +2904,9 @@ class APIServerAdapter(BasePlatformAdapter):
             from toolsets import resolve_toolset
             owner_tool_names = set().union(*(set(resolve_toolset(name)) for name in enabled_toolsets))
             enabled_toolsets = ["api_proposal_only"] + (["memory"] if "memory" in owner_tool_names else [])
+            if host_tool_names:
+                self._validate_host_tools(host_tool_names)
+                enabled_toolsets.append("api_host_tools")
 
         max_iterations = _current_max_iterations()
 
@@ -2935,14 +2941,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES, proposal_only_scope
+        allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
+                   | set(host_tool_names)) if proposal_only else None
+        with proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
+            agent = AIAgent(**agent_kwargs)
         if proposal_only:
             from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES
-            allowed = PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"})
+            # The same exact scope was used while constructing the native prompt.
             # The normal search bridge can defer current-message tools. A restricted
             # run cannot use that bridge, so expose its bounded raw schemas directly.
             from model_tools import get_tool_definitions
-            raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True, skip_tool_search_assembly=True)
+            with proposal_only_scope(True, host_tools=host_tool_names, available_tools=allowed):
+                raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True, skip_tool_search_assembly=True)
             agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in allowed]
             agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
             # This immutable host scope does not admit late MCP discovery. Native
@@ -3732,6 +3743,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "interactive_messages": True,
                 "paper_proposal_only": True,
+                "host_tools_v1": True,
+                "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
                 "session_resources": True,
                 "model_options": True,
@@ -7119,11 +7132,18 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 interaction_context = InteractionContext.model_validate(
                     body["interaction_context"]
-                ).model_dump(exclude_none=True)
+                ).model_dump(exclude_none=True, exclude_defaults=True)
             except (ValueError, TypeError):
                 return web.json_response(_openai_error(
                     "Invalid interaction_context", code="invalid_interaction_context"
                 ), status=400)
+        host_tool_names = tuple((interaction_context or {}).get("host_tools", ()))
+        if host_tool_names:
+            try:
+                self._validate_host_tools(host_tool_names)
+            except ValueError:
+                return web.json_response(_openai_error("Host tools unavailable for this authenticated Run",
+                                         code="host_tools_unavailable"), status=400)
         if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
             return web.json_response(_openai_error("Idempotency-Key must be 1-255 visible ASCII characters",
                                      code="invalid_idempotency_key"), status=400)
@@ -7298,6 +7318,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.platform_activity import begin_platform_activity
 
             platform_activity_lease = None
+            host_broker = None
             try:
                 platform_activity_lease = await begin_platform_activity()
                 self._set_run_status(run_id, "running")
@@ -7316,6 +7337,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
                         interactive_messages=True,
+                        host_tool_names=host_tool_names,
                         proposal_only=bool(interaction_context and interaction_context.get("mode") == "paper"),
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -7340,6 +7362,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         future.cancel()
                         raise RuntimeError("Current conversation delivery is unavailable") from None
+
+                from gateway.host_tools import HostToolBroker, host_tool_scope
+                host_broker = HostToolBroker(run_id, host_tool_names, _publish_interactive,
+                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()))
+                self._run_host_tools[run_id] = host_broker
 
                 def _clarify(question, choices=None, multi_select=False):
                     from tools import clarify_gateway
@@ -7447,8 +7474,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile), current_message_scope(
-                        _deliver_current, interaction_context
-                    ):
+                        _deliver_current, interaction_context,
+                        available_tools=getattr(agent, "valid_tool_names", None)
+                    ), host_tool_scope(host_broker):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -7517,6 +7545,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # Shutdown cancels background tasks without calling /stop.
                         # Release the wait before awaiting the real worker's residency.
                         self._stopping_run_ids.add(run_id)
+                        host_broker.close()
                         from tools.clarify_gateway import clear_session
                         from tools.approval import unregister_gateway_notify
                         clear_session(run_id)
@@ -7645,6 +7674,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if host_broker is not None:
+                    host_broker.close()
+                self._run_host_tools.pop(run_id, None)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -7910,6 +7942,48 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    def _available_host_tools(self):
+        if not self._expected_api_key():
+            return []
+        from hermes_cli.tools_config import _get_platform_tools
+        from gateway.run import _load_gateway_config
+        from tools.registry import registry
+        if "api_host_tools" not in _get_platform_tools(_load_gateway_config(), "api_server"):
+            return []
+        return sorted(name for name, entry in registry._tools.items() if entry.toolset == "api_host_tools")
+
+    def _validate_host_tools(self, names):
+        if not self._expected_api_key() or not set(names) <= set(self._available_host_tools()):
+            raise ValueError("Host tools are unavailable")
+
+    async def _handle_host_tool_result(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        broker = self._run_host_tools.get(run_id)
+        if (not self._expected_api_key() or broker is None or
+            self._run_owners.get(run_id) != self._run_idempotency_scope(request)):
+            return web.json_response(_openai_error("Run not found"), status=404)
+        try:
+            raw = await request.read()
+            if len(raw) > 33792:
+                raise ValueError("Result too large")
+            body = json.loads(raw)
+            if not isinstance(body, dict) or set(body) != {"requestHash", "result"}:
+                raise ValueError("Invalid result")
+            if not isinstance(body["requestHash"], str) or not isinstance(body["result"], dict):
+                raise ValueError("Invalid result")
+        except (ValueError, TypeError, RecursionError):
+            return web.json_response(_openai_error("Invalid host result"), status=400)
+        try:
+            broker.resolve(request.match_info["call_id"], body["requestHash"], body["result"])
+        except LookupError:
+            return web.json_response(_openai_error("Call no longer pending"), status=404)
+        except (ValueError, TypeError, RecursionError):
+            return web.json_response(_openai_error("Conflicting or invalid call result"), status=409)
+        return web.json_response({"resolved": True})
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -7925,6 +7999,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
+        broker = self._run_host_tools.get(run_id)
+        if broker is not None:
+            broker.close()
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
         from tools.clarify_gateway import clear_session

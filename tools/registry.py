@@ -777,6 +777,11 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if entry.toolset == "api_host_tools":
+            # Proxy schemas are plugin-owned; execution belongs exclusively to
+            # the authenticated current Run, never to a native fallback handler.
+            from gateway.host_tools import call_current_host_tool
+            return json.dumps(call_current_host_tool(name, args))
         try:
             if entry.is_async:
                 from model_tools import _run_async

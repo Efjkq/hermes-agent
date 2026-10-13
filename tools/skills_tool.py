@@ -85,6 +85,7 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
     skill_model_invocable,
+    extract_skill_conditions,
 )
 
 logger = logging.getLogger(__name__)
@@ -887,6 +888,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "_conditions": extract_skill_conditions(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -941,7 +943,15 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Find all skills the model may choose on its own; skills marked
         # disable-model-invocation are reached through their wrapper.
-        all_skills = [s for s in _find_all_skills() if s.get("model_invocable", True)]
+        from tools.execution_scope import proposal_available_tools, proposal_available_toolsets
+        from agent.prompt_builder import _skill_should_show
+        scope_tools = proposal_available_tools()
+        all_skills = [
+            {k: v for k, v in s.items() if k != "_conditions"}
+            for s in _find_all_skills()
+            if s.get("model_invocable", True)
+            and (scope_tools is None or _skill_should_show(s.get("_conditions", {}), scope_tools, proposal_available_toolsets()))
+        ]
 
         if not all_skills:
             return json.dumps(
@@ -1135,6 +1145,13 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        from tools.execution_scope import is_proposal_only_scope, proposal_available_tools, proposal_available_toolsets
+        readonly = is_proposal_only_scope()
+        if readonly and (
+            ":" in name
+            or (file_path is not None and not (file_path.startswith("references/") and file_path.endswith(".md")))
+        ):
+            return json.dumps({"success": False, "error": "This read-only scope loads native SKILL.md and Markdown references only."})
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the
@@ -1491,6 +1508,14 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        if readonly:
+            from agent.prompt_builder import _skill_should_show
+            from agent.skill_utils import extract_skill_conditions
+            if not skill_dir or skill_md.is_symlink():
+                return json.dumps({"success": False, "error": "Read-only skill loading requires a native directory-backed Skill."})
+            if not _skill_should_show(extract_skill_conditions(parsed_frontmatter), proposal_available_tools(), proposal_available_toolsets()):
+                return json.dumps({"success": False, "error": "This Skill is unavailable with the current Run's tools."})
+
         if security_enabled and skill_dir:
             security_archive, security_error = _skill_security_verified_archive(
                 skill_dir,
@@ -1700,74 +1725,83 @@ def skill_view(
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
-        legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
-        required_env_vars = _get_required_environment_variables(
-            frontmatter, legacy_env_vars
-        )
-        backend = _get_terminal_backend_name()
-        env_snapshot = load_env()
-        missing_required_env_vars = [
-            e
-            for e in required_env_vars
-            if not e.get("optional")
-            and not _is_env_var_persisted(e["name"], env_snapshot)
-        ]
-        capture_result = _capture_required_environment_variables(
-            skill_name,
-            missing_required_env_vars,
-        )
-        if missing_required_env_vars:
+        required_env_vars = []
+        remaining_missing_required_envs = []
+        missing_cred_files = []
+        setup_needed = False
+        capture_result = {"setup_skipped": False, "gateway_setup_hint": None}
+        if not readonly:
+            legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
+            required_env_vars = _get_required_environment_variables(
+                frontmatter, legacy_env_vars
+            )
+            backend = _get_terminal_backend_name()
             env_snapshot = load_env()
-        remaining_missing_required_envs = _remaining_required_environment_names(
-            required_env_vars,
-            capture_result,
-            env_snapshot=env_snapshot,
-        )
-        setup_needed = bool(remaining_missing_required_envs)
+            missing_required_env_vars = [
+                e
+                for e in required_env_vars
+                if not e.get("optional")
+                and not _is_env_var_persisted(e["name"], env_snapshot)
+            ]
+            capture_result = _capture_required_environment_variables(
+                skill_name,
+                missing_required_env_vars,
+            )
+            if missing_required_env_vars:
+                env_snapshot = load_env()
+            remaining_missing_required_envs = _remaining_required_environment_names(
+                required_env_vars,
+                capture_result,
+                env_snapshot=env_snapshot,
+            )
+            setup_needed = bool(remaining_missing_required_envs)
 
-        # Register available skill env vars so they pass through to sandboxed
-        # execution environments (execute_code, terminal).  Only vars that are
-        # actually set get registered — missing ones are reported as setup_needed.
-        available_env_names = [
-            e["name"]
-            for e in required_env_vars
-            if e["name"] not in remaining_missing_required_envs
-        ]
-        if available_env_names:
-            try:
-                from tools.env_passthrough import register_env_passthrough
+            # Register available skill env vars so they pass through to sandboxed
+            # execution environments (execute_code, terminal).  Only vars that are
+            # actually set get registered — missing ones are reported as setup_needed.
+            available_env_names = [
+                e["name"]
+                for e in required_env_vars
+                if e["name"] not in remaining_missing_required_envs
+            ]
+            if available_env_names:
+                try:
+                    from tools.env_passthrough import register_env_passthrough
 
-                register_env_passthrough(available_env_names)
-            except Exception:
-                logger.debug(
-                    "Could not register env passthrough for skill %s",
-                    skill_name,
-                    exc_info=True,
-                )
+                    register_env_passthrough(available_env_names)
+                except Exception:
+                    logger.debug(
+                        "Could not register env passthrough for skill %s",
+                        skill_name,
+                        exc_info=True,
+                    )
 
-        # Register credential files for mounting into remote sandboxes
-        # (Modal, Docker).  Files that exist on the host are registered;
-        # missing ones are added to the setup_needed indicators.
-        required_cred_files_raw = frontmatter.get("required_credential_files", [])
-        if not isinstance(required_cred_files_raw, list):
-            required_cred_files_raw = []
-        missing_cred_files: list = []
-        if required_cred_files_raw:
-            try:
-                from tools.credential_files import register_credential_files
+            # Register credential files for mounting into remote sandboxes
+            # (Modal, Docker).  Files that exist on the host are registered;
+            # missing ones are added to the setup_needed indicators.
+            required_cred_files_raw = frontmatter.get("required_credential_files", [])
+            if not isinstance(required_cred_files_raw, list):
+                required_cred_files_raw = []
+            missing_cred_files: list = []
+            if required_cred_files_raw:
+                try:
+                    from tools.credential_files import register_credential_files
 
-                missing_cred_files = register_credential_files(required_cred_files_raw)
-                if missing_cred_files:
-                    setup_needed = True
-            except Exception:
-                logger.debug(
-                    "Could not register credential files for skill %s",
-                    skill_name,
-                    exc_info=True,
-                )
+                    missing_cred_files = register_credential_files(required_cred_files_raw)
+                    if missing_cred_files:
+                        setup_needed = True
+                except Exception:
+                    logger.debug(
+                        "Could not register credential files for skill %s",
+                        skill_name,
+                        exc_info=True,
+                    )
 
         rendered_content = content
-        if preprocess:
+        if readonly:
+            from agent.skill_preprocessing import substitute_template_vars
+            rendered_content = substitute_template_vars(content, skill_dir, task_id)
+        elif preprocess:
             try:
                 from agent.skill_preprocessing import preprocess_skill_content
 
@@ -2140,7 +2174,9 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    from tools.execution_scope import is_proposal_only_scope
+    # Re-check disable/security/dependency policy for every restricted Run.
+    stub = None if is_proposal_only_scope() else _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
         return stub
     result = skill_view(
