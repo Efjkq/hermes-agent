@@ -77,6 +77,45 @@ def test_required_tools_filter_both_listing_and_direct_load(bundle):
     assert "unavailable" in direct["error"].lower()
 
 
+@pytest.mark.parametrize("condition", [
+    "requires_tools: [paper_read]",
+    "requires_toolsets: [api_host_tools]",
+])
+@pytest.mark.parametrize("operation", ["list", "view"])
+def test_unbound_native_calls_cannot_discover_host_dependent_skills(bundle, condition, operation):
+    content = (bundle / "SKILL.md").read_text()
+    (bundle / "SKILL.md").write_text(content.replace("requires_tools: [paper_read]", condition))
+    skills._SKILLS_CACHE.clear()
+    if operation == "list":
+        assert json.loads(skills.skills_list())["skills"] == []
+    else:
+        direct = json.loads(skills.skill_view("paper-help"))
+        assert direct["success"] is False
+        assert "unavailable" in direct["error"].lower()
+
+
+def test_unbound_listing_preserves_ordinary_native_dependency_semantics(bundle):
+    content = (bundle / "SKILL.md").read_text()
+    (bundle / "SKILL.md").write_text(content.replace("requires_tools: [paper_read]", "requires_tools: [terminal]"))
+    skills._SKILLS_CACHE.clear()
+    assert [s["name"] for s in json.loads(skills.skills_list())["skills"]] == ["paper-help"]
+
+
+def test_bound_skill_view_cannot_seed_an_unbound_success_stub(bundle, monkeypatch):
+    monkeypatch.setattr("tools.skill_usage.bump_view", lambda *a, **kw: None)
+    monkeypatch.setattr("tools.skill_usage.bump_use", lambda *a, **kw: None)
+    skills.reset_skill_view_dedup("scope-transition")
+    try:
+        with proposal_only_scope(True, host_tools={"paper_read"}):
+            bound = json.loads(skills._skill_view_with_bump({"name": "paper-help"}, task_id="scope-transition"))
+        assert bound["success"] is True
+        unbound = json.loads(skills._skill_view_with_bump({"name": "paper-help"}, task_id="scope-transition"))
+        assert unbound["success"] is False
+        assert "unavailable" in unbound["error"].lower()
+    finally:
+        skills.reset_skill_view_dedup("scope-transition")
+
+
 def test_disabled_skill_cannot_be_loaded_in_paper(bundle, monkeypatch):
     monkeypatch.setattr(skills, "_is_skill_disabled", lambda name: True)
     with proposal_only_scope(True):

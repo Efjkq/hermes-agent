@@ -913,6 +913,23 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+def _skill_available_in_current_scope(conditions: dict) -> bool:
+    from tools.execution_scope import proposal_available_tools, proposal_available_toolsets
+    from agent.prompt_builder import _skill_should_show
+
+    scope_tools = proposal_available_tools()
+    if scope_tools is not None:
+        return _skill_should_show(conditions, scope_tools, proposal_available_toolsets())
+
+    # Ordinary native calls retain their existing dependency semantics, but
+    # registered host proxies are unusable without a current Run binding.
+    from tools.registry import registry
+    return "api_host_tools" not in conditions.get("requires_toolsets", []) and not any(
+        registry.get_toolset_for_tool(name) == "api_host_tools"
+        for name in conditions.get("requires_tools", [])
+    )
+
+
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
@@ -943,14 +960,11 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
         # Find all skills the model may choose on its own; skills marked
         # disable-model-invocation are reached through their wrapper.
-        from tools.execution_scope import proposal_available_tools, proposal_available_toolsets
-        from agent.prompt_builder import _skill_should_show
-        scope_tools = proposal_available_tools()
         all_skills = [
             {k: v for k, v in s.items() if k != "_conditions"}
             for s in _find_all_skills()
             if s.get("model_invocable", True)
-            and (scope_tools is None or _skill_should_show(s.get("_conditions", {}), scope_tools, proposal_available_toolsets()))
+            and _skill_available_in_current_scope(s.get("_conditions", {}))
         ]
 
         if not all_skills:
@@ -1145,7 +1159,7 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
-        from tools.execution_scope import is_proposal_only_scope, proposal_available_tools, proposal_available_toolsets
+        from tools.execution_scope import is_proposal_only_scope
         readonly = is_proposal_only_scope()
         if readonly and (
             ":" in name
@@ -1508,13 +1522,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        from agent.skill_utils import extract_skill_conditions
+        if not _skill_available_in_current_scope(extract_skill_conditions(parsed_frontmatter)):
+            return json.dumps({"success": False, "error": "This Skill is unavailable with the current Run's tools."})
+
         if readonly:
-            from agent.prompt_builder import _skill_should_show
-            from agent.skill_utils import extract_skill_conditions
             if not skill_dir or skill_md.is_symlink():
                 return json.dumps({"success": False, "error": "Read-only skill loading requires a native directory-backed Skill."})
-            if not _skill_should_show(extract_skill_conditions(parsed_frontmatter), proposal_available_tools(), proposal_available_toolsets()):
-                return json.dumps({"success": False, "error": "This Skill is unavailable with the current Run's tools."})
 
         if security_enabled and skill_dir:
             security_archive, security_error = _skill_security_verified_archive(
@@ -2185,7 +2199,10 @@ def _skill_view_with_bump(args, **kw):
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            # A bound Run must not seed an ordinary-call success stub after
+            # its host-tool authority has gone away.
+            if not is_proposal_only_scope():
+                _record_skill_view(task_id, name, args.get("file_path"), parsed)
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
