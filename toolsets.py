@@ -98,7 +98,13 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
+from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES
 TOOLSETS = {
+    "api_proposal_only": {
+        "description": "Research, memory and host-reviewed proposal cards; no arbitrary execution",
+        "tools": sorted(PROPOSAL_ONLY_TOOL_NAMES),
+        "includes": [],
+    },
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
@@ -257,6 +263,10 @@ TOOLSETS = {
         "includes": []
     },
     
+    "api_interactions": {
+        "description": "Current native API Run messages and clarification; no cross-platform sends",
+        "tools": ["send_message", "clarify"], "includes": [],
+    },
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],

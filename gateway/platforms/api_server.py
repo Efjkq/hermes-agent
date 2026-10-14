@@ -57,7 +57,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -71,7 +71,7 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 )
 
 
-async def _await_executor_completion(future: asyncio.Future[Any]) -> Any:
+async def _await_executor_completion(future: asyncio.Future[Any], on_cancel: Optional[Callable[[], None]] = None) -> Any:
     """Preserve worker residency until executor work has actually stopped."""
     cancelled = False
     while not future.done():
@@ -81,7 +81,13 @@ async def _await_executor_completion(future: asyncio.Future[Any]) -> Any:
             # Repeated cancellation must not punch through this wait. Cancelling
             # an executor Future does not stop its thread, and residency belongs
             # to that real worker rather than to its request wrapper.
+            first_cancel = not cancelled
             cancelled = True
+            if first_cancel and on_cancel is not None:
+                try:
+                    on_cancel()
+                except Exception:
+                    logger.exception("Executor cancellation notification failed; preserving worker residency")
         except Exception:
             if cancelled:
                 raise asyncio.CancelledError
@@ -1460,6 +1466,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_idempotency_store = RunIdempotencyStore()
         self._run_idempotency_ids: set[str] = set()
         self._run_owners: Dict[str, str] = {}
+        self._run_host_tools: Dict[str, Any] = {}
         self._run_owner_pid = os.getpid()
         try:
             from gateway.status import get_process_start_time
@@ -2096,6 +2103,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
+            ("POST", "/v1/runs/{run_id}/host-tools/{call_id}/result", self._handle_host_tool_result),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2611,6 +2620,9 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        interactive_messages: bool = False,
+        proposal_only: bool = False,
+        host_tool_names: tuple[str, ...] = (),
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2883,7 +2895,20 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        # Config enables plugin discovery, but host proxies only exist in an
+        # explicitly bound current Run. Ordinary/Live/News retain their tools.
+        enabled_toolsets = sorted(set(_get_platform_tools(user_config, "api_server")) - {"api_host_tools"})
+        if interactive_messages:
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"api_interactions"})
+
+        owner_tool_names = None
+        if proposal_only:
+            from toolsets import resolve_toolset
+            owner_tool_names = set().union(*(set(resolve_toolset(name)) for name in enabled_toolsets))
+            enabled_toolsets = ["api_proposal_only"] + (["memory"] if "memory" in owner_tool_names else [])
+            if host_tool_names:
+                self._validate_host_tools(host_tool_names)
+                enabled_toolsets.append("api_host_tools")
 
         max_iterations = _current_max_iterations()
 
@@ -2918,7 +2943,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
-        agent = AIAgent(**agent_kwargs)
+        from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES, proposal_only_scope
+        allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
+                   | set(host_tool_names)) if proposal_only else None
+        with proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
+            agent = AIAgent(**agent_kwargs)
+        if proposal_only:
+            from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES
+            # The same exact scope was used while constructing the native prompt.
+            # The normal search bridge can defer current-message tools. A restricted
+            # run cannot use that bridge, so expose its bounded raw schemas directly.
+            from model_tools import get_tool_definitions
+            with proposal_only_scope(True, host_tools=host_tool_names, available_tools=allowed):
+                raw_tools = get_tool_definitions(enabled_toolsets=enabled_toolsets, quiet_mode=True, skip_tool_search_assembly=True)
+            agent.tools = [tool for tool in raw_tools if tool["function"]["name"] in allowed]
+            agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+            # This immutable host scope does not admit late MCP discovery. Native
+            # refresh would rebuild broad owner tools and tool-search bridges.
+            agent._skip_mcp_refresh = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -3701,6 +3743,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "interactive_messages": True,
+                "paper_proposal_only": True,
+                "host_tools_v1": True,
+                "host_tool_names": self._available_host_tools(),
+                "run_clarify_response": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -7081,6 +7128,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+        from gateway.interactive_messages import InteractionContext, current_message_scope
+        interaction_context = None
+        if body.get("interaction_context") is not None:
+            try:
+                interaction_context = InteractionContext.model_validate(
+                    body["interaction_context"]
+                ).model_dump(exclude_none=True, exclude_defaults=True)
+            except (ValueError, TypeError):
+                return web.json_response(_openai_error(
+                    "Invalid interaction_context", code="invalid_interaction_context"
+                ), status=400)
+        host_tool_names = tuple((interaction_context or {}).get("host_tools", ()))
+        if host_tool_names:
+            try:
+                self._validate_host_tools(host_tool_names)
+            except ValueError:
+                return web.json_response(_openai_error("Host tools unavailable for this authenticated Run",
+                                         code="host_tools_unavailable"), status=400)
         if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
             return web.json_response(_openai_error("Idempotency-Key must be 1-255 visible ASCII characters",
                                      code="invalid_idempotency_key"), status=400)
@@ -7255,6 +7320,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.platform_activity import begin_platform_activity
 
             platform_activity_lease = None
+            host_broker = None
             try:
                 platform_activity_lease = await begin_platform_activity()
                 self._set_run_status(run_id, "running")
@@ -7272,6 +7338,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
+                        interactive_messages=True,
+                        host_tool_names=host_tool_names,
+                        proposal_only=bool(interaction_context and interaction_context.get("mode") == "paper"),
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
@@ -7283,6 +7352,80 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                     )
                 self._active_run_agents[run_id] = agent
+
+                def _publish_interactive(event):
+                    async def publish():
+                        if self._run_streams.get(run_id) is not q or q.terminal or run_id in self._stopping_run_ids:
+                            raise RuntimeError("Current conversation delivery is unavailable")
+                        q.put_nowait(event)
+                    future = asyncio.run_coroutine_threadsafe(publish(), loop)
+                    try:
+                        future.result(timeout=10)
+                    except Exception:
+                        future.cancel()
+                        raise RuntimeError("Current conversation delivery is unavailable") from None
+
+                from gateway.host_tools import HostToolBroker, host_tool_scope
+                host_broker = HostToolBroker(run_id, host_tool_names, _publish_interactive,
+                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()))
+                self._run_host_tools[run_id] = host_broker
+
+                def _clarify(question, choices=None, multi_select=False):
+                    from tools import clarify_gateway
+                    if run_id in self._stopping_run_ids:
+                        return ""
+                    if not isinstance(question, str) or not question.strip() or len(question) > 4096:
+                        raise ValueError("Clarification question must contain 1–4096 characters")
+                    if choices is not None and (not isinstance(choices, list) or len(choices) > 63 or any(
+                        not isinstance(choice, str) or not 1 <= len(choice) <= 256 for choice in choices
+                    )):
+                        raise ValueError("Clarification supports up to 63 bounded choices")
+                    clarify_id = uuid.uuid4().hex
+                    clarify_gateway.register(
+                        clarify_id, run_id, question, choices, multi_select=multi_select
+                    )
+                    message = {"text": question}
+                    if choices:
+                        buttons = [{"text": choice, "callback_data": f"cl:{clarify_id}:{index}"}
+                                   for index, choice in enumerate(choices)]
+                        message["reply_markup"] = {"inline_keyboard": [buttons[index:index + 8]
+                            for index in range(0, len(buttons), 8)] + [[{"text": "Type an answer", "callback_data": f"cl:{clarify_id}:other"}]]}
+                    if run_id in self._stopping_run_ids:
+                        clarify_gateway.clear_session(run_id)
+                        return ""
+                    try:
+                        _publish_interactive({
+                        "event": "message.interactive", "run_id": run_id,
+                        "timestamp": time.time(), "message_id": f"clarify_{clarify_id}",
+                        "message": message, "context": interaction_context,
+                        "clarify_id": clarify_id, "multi_select": bool(multi_select),
+                        })
+                    except Exception:
+                        clarify_gateway.clear_session(run_id)
+                        if run_id in self._stopping_run_ids:
+                            return ""
+                        raise
+                    response = clarify_gateway.wait_for_response(
+                        clarify_id, clarify_gateway.get_clarify_timeout()
+                    )
+                    if run_id in self._stopping_run_ids:
+                        return ""
+                    try:
+                        _publish_interactive({
+                            "event": "message.clarify_resolved", "run_id": run_id,
+                            "timestamp": time.time(), "clarify_id": clarify_id,
+                            "reason": "answered" if response else "expired",
+                        })
+                    except Exception:
+                        # A detached UI cannot discard an already accepted answer.
+                        logger.debug("Clarification resolution UI delivery unavailable for %s", run_id)
+                    if run_id in self._stopping_run_ids:
+                        return ""
+                    if response is None or response == "":
+                        raise RuntimeError("The clarification expired or the run stopped")
+                    return response
+
+                agent.clarify_callback = _clarify
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
@@ -7323,9 +7466,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
                     effective_task_id = session_id or run_id
+                    def _deliver_current(message, message_id, context, metadata=None):
+                        _publish_interactive({
+                            "event": "message.interactive", "run_id": run_id,
+                            "timestamp": time.time(), "message_id": message_id,
+                            "message": message, "context": context,
+                            **({"metadata": metadata} if metadata is not None else {}),
+                        })
                     approval_token = None
                     session_tokens = []
-                    with self._profile_scope(request_profile):
+                    with self._profile_scope(request_profile), current_message_scope(
+                        _deliver_current, interaction_context,
+                        available_tools=getattr(agent, "valid_tool_names", None)
+                    ), host_tool_scope(host_broker):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -7390,7 +7543,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         None, context.run, _run_sync
                     )
                 if platform_activity_lease.active:
-                    result, usage = await _await_executor_completion(executor_future)
+                    def cancel_interaction():
+                        # Shutdown cancels background tasks without calling /stop.
+                        # Release the wait before awaiting the real worker's residency.
+                        self._stopping_run_ids.add(run_id)
+                        host_broker.close()
+                        from tools.clarify_gateway import clear_session
+                        from tools.approval import unregister_gateway_notify
+                        clear_session(run_id)
+                        unregister_gateway_notify(approval_session_key)
+                        try:
+                            request_hard_interrupt(agent, "API background task cancelled")
+                        except Exception:
+                            pass
+                    result, usage = await _await_executor_completion(executor_future, cancel_interaction)
                 else:
                     result, usage = await executor_future
                 if run_id in self._stopping_run_ids:
@@ -7510,6 +7676,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if host_broker is not None:
+                    host_broker.close()
+                self._run_host_tools.pop(run_id, None)
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -7521,6 +7690,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
+                from tools.clarify_gateway import clear_session
+                clear_session(run_id)
                 # Sentinel: signal SSE stream to close
                 try:
                     _put_event_if_active(None)
@@ -7568,7 +7739,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+        from tools.clarify_gateway import get_pending_for_session
+        pending = get_pending_for_session(run_id, include_choice_prompts=True)
+        return web.json_response({**status, "pending_clarify_id":
+            pending.clarify_id if pending is not None and not pending.event.is_set() else None})
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
@@ -7655,6 +7829,29 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_stream_subscribers.discard(run_id)
         return response
 
+
+    async def _handle_run_clarify(self, request: "web.Request") -> "web.Response":
+        """Resolve only this authenticated run's exact pending question."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        status = self._durable_run_status(request, run_id)
+        if status is None:
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict) or set(body) != {"clarify_id", "response"} or not isinstance(body.get("response"), str) or not 1 <= len(body["response"].strip()) <= 4096:
+            return web.json_response(_openai_error("Invalid clarification response"), status=400)
+        from tools.clarify_gateway import get_pending_for_session, resolve_gateway_clarify
+        entry = get_pending_for_session(run_id, include_choice_prompts=True)
+        if status.get("status") not in {"running", "waiting_for_approval"} or entry is None or entry.clarify_id != body.get("clarify_id") or entry.event.is_set():
+            return web.json_response(_openai_error("Question is no longer active", code="clarify_not_active"), status=409)
+        if not resolve_gateway_clarify(entry.clarify_id, body["response"]):
+            return web.json_response(_openai_error("Question is no longer active", code="clarify_not_active"), status=409)
+        return web.json_response({"resolved": True, "clarify_id": entry.clarify_id})
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
@@ -7747,6 +7944,51 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    def _available_host_tools(self):
+        if not self._expected_api_key():
+            return []
+        from hermes_cli.tools_config import _get_platform_tools
+        from gateway.run import _load_gateway_config
+        from tools.registry import registry
+        if "api_host_tools" not in _get_platform_tools(_load_gateway_config(), "api_server"):
+            return []
+        return sorted(name for name, entry in registry._tools.items() if entry.toolset == "api_host_tools")
+
+    def _validate_host_tools(self, names):
+        if not self._expected_api_key() or not set(names) <= set(self._available_host_tools()):
+            raise ValueError("Host tools are unavailable")
+
+    async def _handle_host_tool_result(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        broker = self._run_host_tools.get(run_id)
+        if (not self._expected_api_key() or broker is None or
+            self._run_owners.get(run_id) != self._run_idempotency_scope(request)):
+            return web.json_response(_openai_error("Run not found"), status=404)
+        try:
+            raw = await request.read()
+            if len(raw) > 33792:
+                raise ValueError("Result too large")
+            body = json.loads(raw)
+            if not isinstance(body, dict) or set(body) != {"requestHash", "result"}:
+                raise ValueError("Invalid result")
+            if not isinstance(body["requestHash"], str) or not isinstance(body["result"], dict):
+                raise ValueError("Invalid result")
+        except (ValueError, TypeError, RecursionError):
+            return web.json_response(_openai_error("Invalid host result"), status=400)
+        from gateway.host_tools import HostCallInactive
+        try:
+            broker.resolve(request.match_info["call_id"], body["requestHash"], body["result"])
+        except HostCallInactive:
+            return web.json_response(_openai_error("Call no longer active", code="host_call_inactive"), status=410)
+        except LookupError:
+            return web.json_response(_openai_error("Call no longer pending"), status=404)
+        except (ValueError, TypeError, RecursionError):
+            return web.json_response(_openai_error("Conflicting or invalid call result"), status=409)
+        return web.json_response({"resolved": True})
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -7762,8 +8004,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
+        broker = self._run_host_tools.get(run_id)
+        if broker is not None:
+            broker.close()
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+        from tools.clarify_gateway import clear_session
+        clear_session(run_id)
 
         if agent is not None:
             try:

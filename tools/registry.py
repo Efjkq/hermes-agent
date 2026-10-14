@@ -694,9 +694,15 @@ class ToolRegistry:
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
+        from tools.execution_scope import proposal_available_tools
+        host_scope = proposal_available_tools()
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:
+                continue
+            # Host proxies need an explicit current-Run binding, including
+            # raw catalogues, all/* aliases and messaging plugin discovery.
+            if entry.toolset == "api_host_tools" and (host_scope is None or name not in host_scope):
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
@@ -770,9 +776,18 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        from tools.execution_scope import execution_scope_error
+        blocked = execution_scope_error(name)
+        if blocked:
+            return blocked
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        if entry.toolset == "api_host_tools":
+            # Proxy schemas are plugin-owned; execution belongs exclusively to
+            # the authenticated current Run, never to a native fallback handler.
+            from gateway.host_tools import call_current_host_tool
+            return json.dumps(call_current_host_tool(name, args))
         try:
             if entry.is_async:
                 from model_tools import _run_async

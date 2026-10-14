@@ -334,6 +334,10 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
+    from tools.execution_scope import proposal_available_tools
+    scope_tools = proposal_available_tools()
+    if scope_tools is not None:
+        skip_tool_search_assembly = True
     cache_key = None
     if quiet_mode:
         try:
@@ -355,6 +359,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                scope_tools,
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
@@ -550,6 +555,11 @@ def _compute_tool_definitions(
                         "function": {**td["function"], "description": desc},
                     }
                     break
+
+    from tools.execution_scope import proposal_available_tools
+    scope_tools = proposal_available_tools()
+    if scope_tools is not None:
+        filtered_tools = [tool for tool in filtered_tools if tool["function"]["name"] in scope_tools]
 
     if not quiet_mode:
         if filtered_tools:
@@ -1161,6 +1171,10 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    from tools.execution_scope import execution_scope_error
+    blocked = execution_scope_error(function_name)
+    if blocked:
+        return blocked
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):

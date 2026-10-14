@@ -1,0 +1,47 @@
+"""Host-bound proposal sessions reuse Agent research without arbitrary execution.
+
+This does not sandbox a shell: shell/code/browser/delegation/background jobs and
+unknown plugin/MCP tools are unavailable in this scope. Financial execution
+belongs to the host's independently authenticated human-confirmation path.
+"""
+from contextlib import contextmanager
+from contextvars import ContextVar
+import json
+
+PROPOSAL_ONLY_TOOL_NAMES = frozenset({
+    "web_search", "web_extract", "x_search",
+    "memory", "session_search", "todo", "skills_list", "skill_view", "send_message", "clarify",
+})
+_policy = ContextVar("host_tool_execution_policy", default=None)
+
+@contextmanager
+def proposal_only_scope(enabled: bool, *, host_tools=(), available_tools=None):
+    from tools.registry import registry
+    host_names = frozenset(host_tools)
+    if any(registry.get_toolset_for_tool(name) != "api_host_tools" for name in host_names):
+        raise ValueError("Host tools must be registered in the api_host_tools proxy toolset")
+    allowed = PROPOSAL_ONLY_TOOL_NAMES | host_names
+    if available_tools is not None:
+        allowed &= frozenset(available_tools)
+    token = _policy.set(allowed if enabled else None)
+    try:
+        yield
+    finally:
+        _policy.reset(token)
+
+def is_proposal_only_scope() -> bool:
+    return _policy.get() is not None
+
+def proposal_available_tools():
+    return _policy.get()
+
+def proposal_available_toolsets():
+    from tools.registry import registry
+    return {toolset for name in (_policy.get() or ())
+            if (toolset := registry.get_toolset_for_tool(name))}
+
+def execution_scope_error(name: str):
+    allowed = _policy.get()
+    if allowed is not None and name not in allowed:
+        return json.dumps({"error": "This proposal-only conversation cannot execute arbitrary tools. Prepare a host card for the user's separate review and confirmation.", "error_type": "proposal_only", "tool": name})
+    return None
