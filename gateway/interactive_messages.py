@@ -59,12 +59,13 @@ class InteractionContext(BaseModel):
     host_data: Optional[dict] = None
     host_tools: list[str] = Field(default_factory=list, max_length=8)
     serial_host_tools: list[str] = Field(default_factory=list, max_length=8)
+    execution_policy: Optional[Literal["proposal_only"]] = None
 
     @model_validator(mode="after")
     def bounded_host_data(self):
         if self.host_tools or self.serial_host_tools:
-            if self.mode != "paper" or len(set(self.host_tools)) != len(self.host_tools):
-                raise ValueError("Host tools require a unique Paper manifest")
+            if not is_proposal_context(self.model_dump()) or len(set(self.host_tools)) != len(self.host_tools):
+                raise ValueError("Host tools require a unique proposal-only manifest")
             if any(not name.isidentifier() or len(name) > 64 for name in self.host_tools):
                 raise ValueError("Invalid host tool name")
             if not set(self.serial_host_tools) <= set(self.host_tools):
@@ -74,6 +75,12 @@ class InteractionContext(BaseModel):
             if len(encoded.encode("utf-8")) > 32768:
                 raise ValueError("Host context is too large")
         return self
+
+
+def is_proposal_context(context: Optional[dict]) -> bool:
+    """Paper's legacy policy and explicit Live policy share the same restrictions."""
+    return bool(context and (context.get("mode") == "paper" or
+                             context.get("execution_policy") == "proposal_only"))
 
 
 _delivery: ContextVar[Optional[Callable[[dict, str, Optional[dict], Optional[dict]], None]]] = ContextVar(
@@ -87,7 +94,7 @@ def current_message_scope(deliver: Callable, context: Optional[dict] = None, *, 
     delivery_token = _delivery.set(deliver)
     context_token = _context.set(deepcopy(context))
     try:
-        with proposal_only_scope(bool(context and context.get("mode") == "paper"),
+        with proposal_only_scope(is_proposal_context(context),
                                  host_tools=(context or {}).get("host_tools", ()),
                                  available_tools=available_tools):
             yield

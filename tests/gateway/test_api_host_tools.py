@@ -34,13 +34,14 @@ class HostAgent:
 
 
 @pytest.mark.asyncio
-async def test_authenticated_native_result_resolves_one_original_run(host_plugin):
+@pytest.mark.parametrize("policy", [{}, {"mode": "live", "execution_policy": "proposal_only"}])
+async def test_authenticated_native_result_resolves_one_original_run(host_plugin, policy):
     adapter, agent = _make_adapter("test-key"), HostAgent()
     headers = {"Authorization": "Bearer test-key"}
     with patch.object(adapter, "_create_agent", return_value=agent):
         async with TestClient(TestServer(_interactive_app(adapter))) as client:
             response = await client.post("/v1/runs", headers=headers, json={
-                "input": "Read", "interaction_context": {**context(), "host_tools": [host_plugin]}})
+                "input": "Read", "interaction_context": {**context(), **policy, "host_tools": [host_plugin]}})
             assert response.status == 202, await response.text()
             run_id = (await response.json())["run_id"]
             stream = await client.get(f"/v1/runs/{run_id}/events", headers=headers)
@@ -57,9 +58,35 @@ async def test_authenticated_native_result_resolves_one_original_run(host_plugin
             assert (await client.post(route.replace(run_id, "other-run"), headers=headers, json=reply)).status == 404
             assert (await client.post(route, headers=headers, json=reply)).status == 200
             await settle(adapter, run_id)
+            assert adapter._create_agent.call_args.kwargs["proposal_only"] is True
             assert agent.result["data"]["balance"] == "100"
             assert agent.result["callId"] == event["callId"]
             stream.release()
+
+
+@pytest.mark.asyncio
+async def test_live_host_manifest_requires_explicit_proposal_policy(host_plugin):
+    adapter = _make_adapter("test-key")
+    async with TestClient(TestServer(_interactive_app(adapter))) as client:
+        response = await client.post("/v1/runs", headers={"Authorization": "Bearer test-key"}, json={
+            "input": "Read", "interaction_context": {**context(), "mode": "live", "host_tools": [host_plugin]}})
+        assert response.status == 400
+        assert not adapter._active_run_tasks
+
+
+def test_live_proposal_scope_blocks_native_execution_and_preserves_metadata(host_plugin):
+    from gateway.interactive_messages import current_message_scope, send_current_message
+    from tools.execution_scope import execution_scope_error
+    delivered = []
+    metadata = {"coachCard": {"version": 1, "kind": "paper_practice_invite", "title": "Practise BTC"}}
+    with current_message_scope(lambda *args: delivered.append(args), {
+        **context(), "mode": "live", "execution_policy": "proposal_only", "host_tools": [host_plugin]
+    }):
+        assert json.loads(execution_scope_error("terminal"))["error_type"] == "proposal_only"
+        assert execution_scope_error(host_plugin) is None
+        assert send_current_message("Practise first", metadata=metadata)["metadata"] == metadata
+    assert delivered[0][3] == metadata
+    assert execution_scope_error("terminal") is None
 
 
 @pytest.mark.asyncio
