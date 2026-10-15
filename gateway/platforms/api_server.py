@@ -3745,6 +3745,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "interactive_messages": True,
                 "paper_proposal_only": True,
+                "live_proposal_only": True,
                 "host_tools_v1": True,
                 "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
@@ -7133,7 +7134,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-        from gateway.interactive_messages import InteractionContext, current_message_scope
+        from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:
             try:
@@ -7497,7 +7498,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         interactive_messages=True,
                         host_tool_names=host_tool_names,
-                        proposal_only=bool(interaction_context and interaction_context.get("mode") == "paper"),
+                        proposal_only=is_proposal_context(interaction_context),
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
