@@ -125,7 +125,12 @@ def send_current_message(text: str, reply_markup=None, metadata=None) -> dict:
                 raise ValueError("Metadata too large")
             metadata = json.loads(encoded)
         except (ValueError, TypeError, RecursionError):
-            return {"error": "Host metadata must be a finite JSON object of at most 32768 bytes"}
+            return {"success": False, "code": "HOST_METADATA_INVALID",
+                    "error": "Host metadata must be a finite JSON object of at most 32768 bytes",
+                    "publication": {"status": "not_attempted"},
+                    "failure": {"category": "invalid_request", "recovery": "correct_request",
+                                "retrySameInput": False, "fields": [{"path": "metadata", "code": "invalid_type",
+                                "message": "Pass a finite JSON object, not a JSON-encoded string. Correct the object before publishing again."}]}}
     deliver = _delivery.get()
     if deliver is None:
         return {"error": "No current conversation delivery is available in this execution context"}

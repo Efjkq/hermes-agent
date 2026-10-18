@@ -382,3 +382,67 @@ async def test_run_recursively_redacts_multiple_json_string_layers(encoding_dept
             "message": 'Normal "quoted" message\nkeeps its newline',
         }
     assert "opaque-depth-secret" not in body
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("representation", ["structured", "json_string", "prefixed"])
+@pytest.mark.parametrize("cursor_id", ["00000000-0000-4000-8000-000000000001", "42"])
+async def test_run_public_receipt_fields_and_page_cursor_survive_replay(representation, cursor_id):
+    import base64
+    cursor = base64.urlsafe_b64encode(json.dumps({
+        "v": "f1" if cursor_id == "42" else "closed-positions-v1", "at": "2026-10-18T06:36:13.123456Z",
+        "id": cursor_id,
+        "q": ["00000000-0000-4000-8000-000000000002", "lighter", None],
+    }, separators=(",", ":")).encode()).decode().rstrip("=")
+    payload = {"status": "ready", "callId": "broker_read_1", "data": {
+        "nextReviewCursor": cursor,
+        "nextSpotReviewCursor": cursor,
+        "action": {"commandKey": None},
+        "completedAction": {"commandKey": "coach:00000000-0000-4000-8000-000000000001:2"},
+        "reviews": [{"scopeKey": "orderly:perp:USDC:pieverse_orderly"}, {"scopeKey": "orderly:perp:USDC:pool.dot"}],
+        "api_key": "opaque-private-key",
+    }}
+    result = payload if representation == "structured" else ("stdout: " if representation == "prefixed" else "") + json.dumps(payload)
+    events, replay, _body = await _run_with_tools([
+        ("native_read_1", "paper_read", {"operation": "review"}, result),
+    ])
+    for stream in (events, replay):
+        output = next(event["result"] for event in stream if event["event"] == "tool.completed")
+        output = json.loads(output.removeprefix("stdout: ")) if isinstance(output, str) else output
+        assert output["data"]["nextReviewCursor"] == cursor
+        assert output["data"]["nextSpotReviewCursor"] == cursor
+        assert output["data"]["action"]["commandKey"] is None
+        assert output["data"]["completedAction"] == payload["data"]["completedAction"]
+        assert output["data"]["reviews"] == payload["data"]["reviews"]
+        assert output["data"]["reviews"][0]["scopeKey"] == payload["data"]["reviews"][0]["scopeKey"]
+        assert output["data"]["api_key"] == "***"
+
+@pytest.mark.asyncio
+async def test_run_still_masks_credentials_in_incomplete_json_fragments():
+    result = 'stdout: "api_key": "opaque-incomplete-secret", "scopeKey": "orderly:perp:USDC"'
+    events, replay, body = await _run_with_tools([
+        ("call-incomplete", "fixture_tool", {}, result),
+    ])
+    for stream in (events, replay):
+        output = next(event["result"] for event in stream if event["event"] == "tool.completed")
+        assert "opaque-incomplete-secret" not in output
+        assert "***" in output
+    assert "opaque-incomplete-secret" not in body
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_unmask_opaque_keys_or_credentials_disguised_as_cursors():
+    import base64
+    cursor = base64.urlsafe_b64encode(json.dumps({
+        "v": "sk-" + "a" * 48, "at": "2026-10-18T06:36:13.123456Z",
+        "id": "00000000-0000-4000-8000-000000000001", "q": [],
+    }).encode()).decode().rstrip("=")
+    result = {"scopeKey": "opaque-routing-secret", "commandKey": "opaque-command-secret",
+              "nextReviewCursor": cursor, "api_key": "opaque-api-secret"}
+    events, replay, body = await _run_with_tools([("call-invalid-public", "fixture_tool", {}, result)])
+    for stream in (events, replay):
+        output = next(event["result"] for event in stream if event["event"] == "tool.completed")
+        assert output["scopeKey"] == "***"
+        assert output["commandKey"] == "***"
+        assert output["nextReviewCursor"] != cursor
+        assert output["api_key"] == "***"
+    assert "opaque-" not in body

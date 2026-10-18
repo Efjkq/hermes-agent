@@ -7320,10 +7320,51 @@ class APIServerAdapter(BasePlatformAdapter):
                     or normalized in _SENSITIVE_BODY_KEYS
                     or json_secret_key.fullmatch(normalized) is not None)
 
+        public_cursor_fields = frozenset({"cursor", "next_cursor", "next_review_cursor", "next_spot_review_cursor"})
+        not_public = object()
+
+        def _public_receipt_value(key, value):
+            normalized = _normalize_key(key)
+            if normalized == "command_key":
+                # Empty or structured idempotency references cannot be keys.
+                if value is None or (isinstance(value, str) and re.fullmatch(
+                        r"[A-Za-z][A-Za-z0-9_-]{0,31}:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}:[1-9][0-9]{0,9}", value)):
+                    return value
+            if normalized == "scope_key" and isinstance(value, str) and re.fullmatch(
+                    r"[a-z][a-z0-9_-]{0,31}:(?:spot|perp):[A-Za-z0-9@._-]{1,64}(?::[A-Za-z0-9_.-]{1,128})?", value):
+                if redact_sensitive_text(value, force=True, redact_url_credentials=True) == value:
+                    return value
+            if normalized not in public_cursor_fields or not isinstance(value, str) or len(value) > 2048:
+                return not_public
+            # A keyset cursor is base64 JSON, not a one-segment JWT. Only this
+            # bounded, noncredential shape bypasses the generic JWT heuristic.
+            import base64
+            try:
+                decoded = json.loads(base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)))
+            except (ValueError, TypeError):
+                return not_public
+            if (not isinstance(decoded, dict) or set(decoded) != {"v", "at", "id", "q"}
+                    or not isinstance(decoded["v"], str) or not re.fullmatch(r"[A-Za-z0-9:_-]{1,64}", decoded["v"])
+                    or not isinstance(decoded["at"], str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", decoded["at"])
+                    or not isinstance(decoded["id"], str) or not re.fullmatch(r"(?:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[1-9][0-9]{0,18})", decoded["id"])
+                    or not isinstance(decoded["q"], list) or len(decoded["q"]) > 20):
+                return not_public
+            if redact_sensitive_text(decoded["v"], force=True, redact_url_credentials=True) != decoded["v"]:
+                return not_public
+            import math
+            for item in decoded["q"]:
+                if isinstance(item, float) and not math.isfinite(item):
+                    return not_public
+                if item is not None and not isinstance(item, (str, int, float, bool)):
+                    return not_public
+                if isinstance(item, str) and (len(item) > 512 or redact_sensitive_text(item, force=True, redact_url_credentials=True) != item):
+                    return not_public
+            return value
+
         def _safe_tool_text(value):
-            # A log prefix may precede a standalone JSON string, array or
-            # object. Decode complete fragments before scanning loose fields,
-            # so encoded strings do not need an enclosing response object.
+            value = _safe_tool_loose_text(value, redact_text=False)
+            # Keep complete JSON fragments structured. Redacting the serialized
+            # result again would mask validated public cursors a second time.
             parts = []
             copied_through = search_from = 0
             while match := json_fragment.search(value, search_from):
@@ -7333,13 +7374,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 except json.JSONDecodeError:
                     continue
                 safe = _safe_tool_value(item)
-                if safe != item:
-                    parts.extend((value[copied_through:match.start()], json.dumps(safe)))
-                    copied_through = value_end
-                search_from = value_end
-            parts.append(value[copied_through:])
-            value = "".join(parts)
+                parts.extend((_safe_tool_loose_text(value[copied_through:match.start()]),
+                              json.dumps(safe) if safe != item else value[match.start():value_end]))
+                copied_through = search_from = value_end
+            parts.append(_safe_tool_loose_text(value[copied_through:]))
+            return "".join(parts)
 
+        def _safe_tool_loose_text(value, *, redact_text=True):
             # Stdout can prefix/suffix JSON fragments with ordinary text. Match
             # field keys, then let the JSON decoder find the complete value
             # boundary (including escaped quotes, arrays and objects).
@@ -7358,13 +7399,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # A normal field can contain objects, arrays or JSON-encoded
                 # strings with credentials several layers below it. Reuse the
                 # same recursive sanitizer rather than skipping its value.
-                safe = "***" if _credential_field(key) else _safe_tool_value(item)
+                public = _public_receipt_value(key, item)
+                safe = public if public is not not_public else "***" if _credential_field(key) else _safe_tool_value(item)
                 if safe != item:
                     parts.extend((value[copied_through:search_from], json.dumps(safe)))
                     copied_through = value_end
                 search_from = value_end
             parts.append(value[copied_through:])
-            return redact_sensitive_text("".join(parts), force=True, redact_url_credentials=True)
+            text = "".join(parts)
+            return redact_sensitive_text(text, force=True, redact_url_credentials=True) if redact_text else text
 
         def _safe_tool_value(value):
             if isinstance(value, str):
@@ -7390,7 +7433,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Mask the whole credential value, including numbers,
                     # arrays and objects. Never rewrite serialized JSON with a
                     # text regex: quoted/newline values can corrupt its syntax.
-                    safe[key] = "***" if _credential_field(key) else _safe_tool_value(item)
+                    public = _public_receipt_value(key, item)
+                    safe[key] = public if public is not not_public else "***" if _credential_field(key) else _safe_tool_value(item)
                 return safe
             return value
 
