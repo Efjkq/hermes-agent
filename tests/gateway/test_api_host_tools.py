@@ -27,9 +27,12 @@ class HostAgent:
     session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
     valid_tool_names = {"test_host_read", "skills_list", "skill_view"}
 
+    def __init__(self, arguments=None):
+        self.arguments = arguments or {}
+
     def run_conversation(self, **kwargs):
         from model_tools import handle_function_call
-        self.result = json.loads(handle_function_call("test_host_read", {}))
+        self.result = json.loads(handle_function_call("test_host_read", self.arguments))
         return {"final_response": "done"}
 
 
@@ -111,23 +114,36 @@ def test_scoped_schema_cache_cannot_restore_broad_tools(host_plugin):
     assert {t["function"]["name"] for t in second} == {"skill_view"}
 
 @pytest.mark.asyncio
-async def test_stop_releases_host_wait_without_native_or_channel_fallback(host_plugin):
-    adapter, agent = _make_adapter("test-key"), HostAgent()
+@pytest.mark.parametrize("platform_run_id", [None, "platform-original-run"])
+async def test_stop_releases_host_wait_without_native_or_channel_fallback(host_plugin, platform_run_id):
+    adapter, agent = _make_adapter("test-key"), HostAgent({"runId": "model-forged-run"})
     headers = {"Authorization": "Bearer test-key"}
+    interaction_context = {**context(), "host_tools": [host_plugin]}
+    if platform_run_id is not None:
+        interaction_context["context_id"] = platform_run_id
     with patch.object(adapter, "_create_agent", return_value=agent):
         async with TestClient(TestServer(_interactive_app(adapter))) as client:
             response = await client.post("/v1/runs", headers=headers, json={"input": "Read",
-                "interaction_context": {**context(), "host_tools": [host_plugin]}})
+                "interaction_context": interaction_context})
+            assert response.status == 202, await response.text()
             run_id = (await response.json())["run_id"]
             stream = await client.get(f"/v1/runs/{run_id}/events", headers=headers)
             while True:
                 line = await asyncio.wait_for(stream.content.readline(), 5)
-                if line.startswith(b"data:") and json.loads(line[5:]).get("event") == "host_tool.request":
-                    break
+                if line.startswith(b"data:"):
+                    event = json.loads(line[5:])
+                    if event.get("event") == "host_tool.request":
+                        break
+            assert event["run_id"] == run_id
             task = adapter._active_run_tasks[run_id]
             assert (await client.post(f"/v1/runs/{run_id}/stop", headers=headers)).status == 200
             await asyncio.wait_for(task, 2)
-            assert agent.result["error"]["code"] == "HOST_CALL_CANCELLED"
+            expected = {"status": "error", "error": {"code": "HOST_CALL_CANCELLED"},
+                        "callId": event["callId"]}
+            if platform_run_id is not None:
+                assert platform_run_id != run_id
+                expected["runId"] = platform_run_id
+            assert agent.result == expected
             assert run_id not in adapter._run_host_tools
             stream.release()
 

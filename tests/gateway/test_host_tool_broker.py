@@ -63,8 +63,55 @@ def test_timeout_reports_original_call_id_and_rejects_late_result():
     request = events.get_nowait()
     assert result["callId"] == request["callId"]
     assert result["error"]["code"] == "HOST_CALL_UNKNOWN"
+    assert "runId" not in result
     with pytest.raises(LookupError):
         host.resolve(request["callId"], request["requestHash"], {"status": "ready"})
+    host.close()
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "publish_failure", "stop", "already_stopped"])
+def test_uncertain_host_outcome_preserves_original_platform_run_identity(outcome):
+    from gateway.host_tools import HostCallInactive, HostToolBroker
+    events = Queue()
+    release_publish = threading.Event()
+
+    def publish(event):
+        events.put(event)
+        if outcome == "stop":
+            # Keep the worker in publication until Stop has installed its reply;
+            # coordinator scheduling must not race the broker's 50ms deadline.
+            assert release_publish.wait(timeout=2), "Stop did not release publication"
+        if outcome == "publish_failure":
+            raise RuntimeError("Delivery outcome is unknown")
+
+    host = HostToolBroker("native-run", {"prepare"}, publish,
+                          recovery_run_id="platform-original-run", timeout=0.05)
+    arguments = {"runId": "model-forged-run", "context_id": "model-forged-context"}
+    request = None
+    if outcome == "stop":
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            waiting = worker.submit(host.call, "prepare", arguments)
+            request = events.get(timeout=2)
+            host.close()
+            release_publish.set()
+            result = waiting.result(timeout=2)
+    else:
+        if outcome == "already_stopped":
+            host.close()
+        result = host.call("prepare", arguments)
+        if outcome != "already_stopped":
+            request = events.get_nowait()
+
+    code = "HOST_CALL_CANCELLED" if outcome in {"stop", "already_stopped"} else "HOST_CALL_UNKNOWN"
+    assert result == {"status": "error", "error": {"code": code},
+                      "callId": result["callId"], "runId": "platform-original-run"}
+    if request is not None:
+        assert result["callId"] == request["callId"]
+        assert request["run_id"] == "native-run"
+        with pytest.raises(HostCallInactive):
+            host.resolve(request["callId"], request["requestHash"], {"status": "ready"})
+    else:
+        assert events.empty()
     host.close()
 
 
