@@ -7536,7 +7536,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 # proposal-only manifest, including child-agent discovery.
                 broker_names = (*host_tool_names, PUBLICATION_OPERATION) if publication_ack else host_tool_names
                 host_broker = HostToolBroker(run_id, broker_names, _publish_interactive,
-                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()))
+                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()),
+                    recovery_run_id=(interaction_context or {}).get("context_id") if host_tool_names else None)
                 self._run_host_tools[run_id] = host_broker
 
                 def _clarify(question, choices=None, multi_select=False):
