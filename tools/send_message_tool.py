@@ -242,7 +242,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
-                "description": "Optional host action proposals for current delivery (maximum 32KiB). This is untrusted data; only host-validated, registered actions can be confirmed. Never include credentials."
+                "description": "Optional structured host metadata for current delivery (maximum 32KiB). Pass an actual JSON object, never a JSON-encoded string. Follow the active Skill contract or copy prepared host metadata unchanged. Only a successful registered publication proves delivery; correct failure.fields rather than repeat rejected input. Never include credentials."
             },
             "emoji": {
                 "type": "string",

@@ -3,13 +3,37 @@ from copy import deepcopy
 import hashlib
 import json
 import threading
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 PUBLICATION_OPERATION = "__publish_current_message"
 PUBLICATION_REQUEST_BYTES = 65536
+
+
+class CorrectionField(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    path: str = Field(max_length=120)
+    code: str = Field(pattern=r"^[a-z_]{1,64}$")
+    message: str | None = Field(default=None, max_length=240)
+    allowedValues: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=30)
+    unknownKeys: list[Annotated[str, Field(max_length=80)]] | None = Field(default=None, max_length=20)
+
+
+class Correction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    category: str = Field(pattern=r"^[a-z_]{1,64}$")
+    recovery: str = Field(pattern=r"^[a-z_]{1,64}$")
+    fields: list[CorrectionField] = Field(default_factory=list, max_length=20)
+    retrySameInput: bool
+
+
+def _public_correction(raw):
+    try:
+        return Correction.model_validate(raw).model_dump(exclude_none=True)
+    except (ValueError, TypeError):
+        return None
 
 
 class Registration(BaseModel):
@@ -73,6 +97,9 @@ class AcknowledgedPublisher:
                               "retrySameInput": result.get("retrySameInput", reason not in {
                                   "HOST_REQUEST_INVALID", "HOST_CALL_LIMIT", "HOST_TOOL_UNAVAILABLE",
                                   "HOST_CALL_CANCELLED"})}
+                    correction = _public_correction(result.get("failure"))
+                    if correction is not None:
+                        failed["failure"] = correction
                     if failed["retrySameInput"] is False:
                         entry["rejected"] = failed
                     return deepcopy(failed)

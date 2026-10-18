@@ -145,3 +145,47 @@ def test_publication_budget_supports_utf8_and_metadata_without_widening_other_ho
     with current_message_scope(AcknowledgedPublisher(InvalidHost(), lambda *args: None)):
         failed = send_current_message("Card too large", metadata=CARD)
     assert failed["success"] is False and failed["retrySameInput"] is False
+
+
+def test_host_card_correction_fields_reach_the_agent_without_publishing_or_retrying():
+    host, visible = Host(), []
+    correction = {"category": "invalid_request", "recovery": "correct_request", "retrySameInput": False,
+                  "fields": [{"path": "metadata.coachCard.kind", "code": "invalid_union_discriminator",
+                              "allowedValues": ["paper_practice_invite", "playbook_proposal"]}]}
+    host.failures = [{"status": "blocked", "reason": "CARD_INVALID", "retrySameInput": False,
+                      "failure": correction}]
+    publisher = AcknowledgedPublisher(host, lambda *args: visible.append(args))
+    with current_message_scope(publisher):
+        result = send_current_message("Your preferences", metadata=CARD)
+    assert result["success"] is False and not visible
+    assert result.get("failure") == correction
+    assert len(host.calls) == 1
+
+
+def test_invalid_string_metadata_requests_an_object_instead_of_claiming_a_card_exists():
+    delivered = []
+    with current_message_scope(lambda *args: delivered.append(args)):
+        result = send_current_message("Your preferences", metadata='{"coachCard":{"version":1}}}')
+    assert result.get("success") is False
+    assert result.get("code") == "HOST_METADATA_INVALID"
+    assert result["failure"]["recovery"] == "correct_request"
+    assert result["failure"]["fields"][0]["path"] == "metadata"
+    assert delivered == []
+
+
+def test_correction_feedback_is_bounded_and_ignores_unrelated_host_details():
+    host, visible = Host(), []
+    correction = {"category": "invalid_request", "recovery": "correct_request", "retrySameInput": False,
+                  "secret": "must not cross", "fields": [{"path": "metadata.coachCard.kind", "code": "invalid_type",
+                  "message": "Expected object", "stack": "must not cross"}]}
+    host.failures = [{"status": "blocked", "reason": "CARD_INVALID", "retrySameInput": False,
+                      "failure": correction}]
+    with current_message_scope(AcknowledgedPublisher(host, lambda *args: visible.append(args))):
+        result = send_current_message("Invalid card", metadata=CARD)
+    assert result["failure"] == {"category": "invalid_request", "recovery": "correct_request", "retrySameInput": False,
+                                  "fields": [{"path": "metadata.coachCard.kind", "code": "invalid_type", "message": "Expected object"}]}
+    correction["fields"][0]["message"] = "x" * 241
+    host.failures = [{"status": "blocked", "reason": "CARD_INVALID", "retrySameInput": False, "failure": correction}]
+    with current_message_scope(AcknowledgedPublisher(host, lambda *args: visible.append(args))):
+        rejected = send_current_message("Other invalid card", metadata=CARD)
+    assert rejected["success"] is False and "failure" not in rejected and visible == []
