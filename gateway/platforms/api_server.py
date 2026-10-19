@@ -2100,6 +2100,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("POST", "/v1/runs/lookup", self._handle_run_lookup),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -3732,6 +3733,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_idempotency_lookup": True,
                 "runs_idempotency": {
                     "supported": True,
                     "durable": self._run_idempotency_store.durable,
@@ -7113,6 +7115,26 @@ class APIServerAdapter(BasePlatformAdapter):
         return _callback
 
     @_admit_api_agent_request
+    async def _handle_run_lookup(self, request: "web.Request") -> "web.Response":
+        """Recover a native run ID under the same profile/bearer scope as submit."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        key = body.get("idempotency_key")
+        if (set(body) != {"idempotency_key"} or not isinstance(key, str)
+                or not key or len(key) > 255
+                or any(ord(ch) < 33 or ord(ch) > 126 for ch in key)):
+            return web.json_response(_openai_error("Invalid idempotency key", code="invalid_idempotency_key"), status=400)
+        run_id = self._run_idempotency_store.run_for_key(self._run_idempotency_scope(request), key)
+        status = self._durable_run_status(request, run_id) if run_id else None
+        if status is None:
+            return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
+        # Content-free recovery: do not expose a saved input/output/fingerprint.
+        return web.json_response({"run_id": run_id, "status": status["status"]})
+
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         # Long-term memory scope header (see chat_completions for details).
