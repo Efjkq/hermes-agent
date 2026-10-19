@@ -456,7 +456,8 @@ async def test_publication_ack_waits_for_authenticated_registration_before_deliv
                 publication = event['arguments']
                 result = {'status': 'ready' if accepted else 'blocked',
                           'publication': {'status': 'registered' if accepted else 'rejected',
-                                          'messageId': publication['message_id']},
+                                          'messageId': publication['message_id'], 'runId': '00000000-0000-4000-8000-000000000001',
+                                          'sessionId': '00000000-0000-4000-8000-000000000002', 'hash': 'b' * 64},
                           'registered': {'coachCard': {'version': 1, 'id': 'card-id', 'kind': 'paper_practice_invite'}}}
                 route = f"/v1/runs/{run_id}/host-tools/{event['callId']}/result"
                 wire = {'requestHash': event['requestHash'], 'result': result}

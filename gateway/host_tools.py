@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from uuid import uuid4
+from gateway.publication_receipts import PUBLICATION_OPERATION, PUBLICATION_REQUEST_BYTES
 
 
 def _encoded(value, limit):
@@ -18,9 +19,10 @@ def _encoded(value, limit):
     return encoded
 
 
-def _error(code, call_id=None):
+def _error(code, call_id=None, recovery_run_id=None):
     return {"status": "error", "error": {"code": code},
-            **({"callId": call_id} if call_id else {})}
+            **({"callId": call_id} if call_id else {}),
+            **({"runId": recovery_run_id} if call_id and recovery_run_id is not None else {})}
 
 
 class HostCallInactive(LookupError):
@@ -28,9 +30,11 @@ class HostCallInactive(LookupError):
 
 
 class HostToolBroker:
-    def __init__(self, run_id, names, publish, *, serial_tools=(), timeout=15, publication_ack=False):
+    def __init__(self, run_id, names, publish, *, serial_tools=(), timeout=15, recovery_run_id=None):
         self.run_id = run_id
-        self.publication_ack = publication_ack
+        # Retain the caller's validated identity independently of native run routing
+        # and model-provided arguments for the lifetime of this broker.
+        self._recovery_run_id = recovery_run_id
         self.names = frozenset(names)
         self.serial_tools = frozenset(serial_tools)
         if not self.serial_tools <= self.names or not 0 < timeout <= 15:
@@ -45,24 +49,23 @@ class HostToolBroker:
         self._closed = False
 
     def call(self, name, arguments):
-        publication = name == "__publish_current_message" and self.publication_ack
-        if name not in self.names and not publication:
+        if name not in self.names:
             return _error("HOST_TOOL_UNAVAILABLE")
         try:
-            encoded = _encoded(arguments, 65536 if publication else 8192)
+            encoded = _encoded(arguments, PUBLICATION_REQUEST_BYTES if name == PUBLICATION_OPERATION else 8192)
         except (ValueError, TypeError, RecursionError):
             return _error("HOST_REQUEST_INVALID")
         call_id = uuid4().hex
         request_hash = hashlib.sha256((name + "\n" + encoded).encode("utf-8")).hexdigest()
         started = time.monotonic()
-        slot = self._serial if publication or name in self.serial_tools else self._reads
+        slot = self._serial if name in self.serial_tools else self._reads
         if not slot.acquire(timeout=self.timeout):
             return _error("HOST_CALL_NOT_STARTED", call_id)
         entry = {"event": threading.Event(), "hash": request_hash, "reply": None}
         try:
             with self._lock:
                 if self._closed:
-                    return _error("HOST_CALL_CANCELLED", call_id)
+                    return _error("HOST_CALL_CANCELLED", call_id, self._recovery_run_id)
                 if len(self._settled) >= 64:
                     return _error("HOST_CALL_LIMIT", call_id)
                 self._pending[call_id] = entry
@@ -75,13 +78,13 @@ class HostToolBroker:
                     "requestHash": request_hash, "deadline": time.time() + remaining,
                 })
             except Exception:
-                return _error("HOST_CALL_UNKNOWN", call_id)
+                return _error("HOST_CALL_UNKNOWN", call_id, self._recovery_run_id)
             entry["event"].wait(timeout=max(0, self.timeout - (time.monotonic() - started)))
             with self._lock:
                 if entry["reply"] is None:
                     entry["inactive"] = True
                     self._settled[call_id] = {"hash": request_hash, "reply": None, "inactive": True}
-                    return _error("HOST_CALL_UNKNOWN", call_id)
+                    return _error("HOST_CALL_UNKNOWN", call_id, self._recovery_run_id)
                 return deepcopy(entry["reply"])
         finally:
             with self._lock:
@@ -123,7 +126,7 @@ class HostToolBroker:
             self._closed = True
             for call_id, entry in self._pending.items():
                 if entry["reply"] is None:
-                    entry["reply"] = _error("HOST_CALL_CANCELLED", call_id)
+                    entry["reply"] = _error("HOST_CALL_CANCELLED", call_id, self._recovery_run_id)
                     entry["inactive"] = True
                 entry["event"].set()
 

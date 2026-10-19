@@ -124,6 +124,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from gateway.platforms.api_server_runs import _RunStream, _RUN_STREAM_SUBSCRIBER_OVERFLOW, _RUN_STREAM_WRITE_TIMEOUT
+from gateway.platforms.api_server_tool_payloads import safe_tool_value as _safe_tool_value
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -3829,9 +3830,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "interactive_messages": True,
-                "publication_ack_v1": True,
                 "paper_proposal_only": True,
+                "live_proposal_only": True,
                 "host_tools_v1": True,
+                "publication_ack_v1": bool(self._expected_api_key()),
                 "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
                 "session_resources": True,
@@ -4013,6 +4015,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 and isinstance(run.get("idempotency_key"), str)
                 and re.fullmatch(r"[\x21-\x7e]{1,255}", run["idempotency_key"])):
             payload["api_run"] = {"id": run["id"], "idempotency_key": run["idempotency_key"]}
+        if payload.get("role") == "tool" and "content" in payload:
+            payload["content"] = _safe_tool_value(payload["content"])
+        if isinstance(payload.get("tool_calls"), list):
+            calls = []
+            for call in payload["tool_calls"]:
+                if isinstance(call, dict) and isinstance(call.get("function"), dict):
+                    function = dict(call["function"])
+                    if "arguments" in function:
+                        function["arguments"] = _safe_tool_value(function["arguments"])
+                    call = {**call, "function": function}
+                calls.append(call)
+            payload["tool_calls"] = calls
         return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
@@ -7138,6 +7152,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    **({"tool_call_id": kwargs["tool_call_id"], "args": args}
+                       if kwargs.get("tool_call_id") else {}),
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -7147,6 +7163,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    **({"tool_call_id": kwargs["tool_call_id"], "args": args,
+                        "result": kwargs.get("result")}
+                       if kwargs.get("tool_call_id") else {}),
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -7241,12 +7260,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
-        publication_ack = body.get("publication_ack", False)
-        if type(publication_ack) is not bool or (publication_ack and not self._expected_api_key()):
-            return web.json_response(_openai_error("Publication acknowledgement requires a boolean flag and configured authentication",
-                                     code="invalid_publication_ack"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-        from gateway.interactive_messages import InteractionContext, current_message_scope
+        from gateway.interactive_messages import InteractionContext, current_message_scope, is_proposal_context
         interaction_context = None
         if body.get("interaction_context") is not None:
             try:
@@ -7257,6 +7272,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(
                     "Invalid interaction_context", code="invalid_interaction_context"
                 ), status=400)
+        publication_ack = body.get("publication_ack", False)
+        if not isinstance(publication_ack, bool) or (publication_ack and not self._expected_api_key()):
+            return web.json_response(_openai_error("Publication acknowledgements require an authenticated Run",
+                                     code="publication_ack_unavailable"), status=400)
         host_tool_names = tuple((interaction_context or {}).get("host_tools", ()))
         if host_tool_names:
             try:
@@ -7387,6 +7406,65 @@ class APIServerAdapter(BasePlatformAdapter):
 
         event_cb = self._make_run_event_callback(run_id, loop)
 
+        # Exact callbacks own tool lifecycle events. The engine also fires its
+        # legacy progress callback for each call; forwarding both duplicates
+        # activity and loses identity when same-name calls overlap.
+        tool_started_at: Dict[str, float] = {}
+        tool_event_lock = threading.Lock()
+        native_tool_progress = threading.local()
+
+        def _tool_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            if event_type == "tool.completed":
+                # Native emitters report progress then exact completion on the
+                # same dispatch thread. Keep their failure/duration metadata
+                # without matching overlapping calls by tool name globally.
+                native_tool_progress.completed = (
+                    tool_name, kwargs.get("result"), kwargs.get("is_error"), kwargs.get("duration"),
+                )
+            elif event_type == "tool.started":
+                native_tool_progress.completed = None
+            else:
+                event_cb(event_type, tool_name, preview, args, **kwargs)
+
+
+        def _tool_start(tool_call_id, function_name, function_args):
+            if not tool_call_id or function_name.startswith("_"):
+                return
+            with tool_event_lock:
+                if tool_call_id in tool_started_at:
+                    return
+                tool_started_at[tool_call_id] = time.monotonic()
+            from agent.display import build_tool_preview
+
+            args = _safe_tool_value(function_args or {})
+            event_cb("tool.started", function_name, build_tool_preview(function_name, args),
+                     args=args,
+                     tool_call_id=tool_call_id)
+
+        def _tool_complete(tool_call_id, function_name, function_args, function_result):
+            metadata = getattr(native_tool_progress, "completed", None)
+            native_tool_progress.completed = None
+            if not tool_call_id or function_name.startswith("_"):
+                return
+            with tool_event_lock:
+                started_at = tool_started_at.pop(tool_call_id, None)
+            from agent.display import _detect_tool_failure
+
+            result_text = (function_result if isinstance(function_result, str)
+                           else json.dumps(function_result))
+            is_error, _ = _detect_tool_failure(function_name, result_text)
+            duration = time.monotonic() - started_at if started_at is not None else 0.0
+            if metadata is not None and metadata[0] == function_name and metadata[1] == function_result:
+                if isinstance(metadata[2], bool):
+                    is_error = metadata[2]
+                if isinstance(metadata[3], (int, float)) and metadata[3] >= 0:
+                    duration = metadata[3]
+            event_cb("tool.completed", function_name,
+                     args=_safe_tool_value(function_args or {}),
+                     tool_call_id=tool_call_id,
+                     result=_safe_tool_value(function_result),
+                     duration=duration, is_error=is_error)
+
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
@@ -7458,11 +7536,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent = self._create_agent(
                         interactive_messages=True,
                         host_tool_names=host_tool_names,
-                        proposal_only=bool(interaction_context and interaction_context.get("mode") == "paper"),
+                        proposal_only=is_proposal_context(interaction_context),
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
+                        tool_progress_callback=_tool_progress,
+                        tool_start_callback=_tool_start,
+                        tool_complete_callback=_tool_complete,
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
@@ -7484,9 +7564,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         raise RuntimeError("Current conversation delivery is unavailable") from None
 
                 from gateway.host_tools import HostToolBroker, host_tool_scope
-                host_broker = HostToolBroker(run_id, host_tool_names, _publish_interactive,
+                from gateway.publication_receipts import PUBLICATION_OPERATION, AcknowledgedPublisher
+                # Transport capability only. Keep it out of model schemas and the
+                # proposal-only manifest, including child-agent discovery.
+                broker_names = (*host_tool_names, PUBLICATION_OPERATION) if publication_ack else host_tool_names
+                host_broker = HostToolBroker(run_id, broker_names, _publish_interactive,
                     serial_tools=(interaction_context or {}).get("serial_host_tools", ()),
-                    publication_ack=publication_ack)
+                    recovery_run_id=(interaction_context or {}).get("context_id") if host_tool_names else None)
                 self._run_host_tools[run_id] = host_broker
 
                 def _clarify(question, choices=None, multi_select=False):
@@ -7585,34 +7669,22 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
                     effective_task_id = session_id or run_id
-                    def _deliver_current(message, message_id, context, metadata=None):
-                        registered = None
-                        if publication_ack:
-                            receipt = host_broker.call("__publish_current_message", {
-                                "success": True, "message_id": message_id, "message": message,
-                                **({"metadata": metadata} if metadata is not None else {}),
-                            })
-                            proof = receipt.get("publication", {})
-                            registered = receipt.get("registered")
-                            if (receipt.get("status") != "ready" or not isinstance(proof, dict)
-                                    or proof.get("status") != "registered" or proof.get("messageId") != message_id
-                                    or not isinstance(registered, dict)):
-                                raise RuntimeError("Current conversation registration is unavailable")
+                    def _deliver_current(message, message_id, context, metadata=None, *, registered=None):
                         presentation = ({key: registered[key] for key in ("coachCard", "callbackScope", "context")
                                          if key in registered} if registered is not None else {})
                         _publish_interactive({
                             "event": "message.interactive", "run_id": run_id,
                             "timestamp": time.time(), "message_id": message_id,
                             "message": message,
-                            "context": presentation.get("context") if publication_ack else context,
+                            "context": presentation.get("context") if registered is not None else context,
                             **presentation,
                             **({"metadata": metadata} if metadata is not None else {}),
                         })
-                        return {"context": presentation.get("context"), **presentation} if publication_ack else None
+                    deliver_current = AcknowledgedPublisher(host_broker, _deliver_current) if publication_ack else _deliver_current
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile), current_message_scope(
-                        _deliver_current, interaction_context,
+                        deliver_current, interaction_context,
                         available_tools=getattr(agent, "valid_tool_names", None)
                     ), host_tool_scope(host_broker):
                         try:

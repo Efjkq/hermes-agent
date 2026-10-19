@@ -59,12 +59,13 @@ class InteractionContext(BaseModel):
     host_data: Optional[dict] = None
     host_tools: list[str] = Field(default_factory=list, max_length=8)
     serial_host_tools: list[str] = Field(default_factory=list, max_length=8)
+    execution_policy: Optional[Literal["proposal_only"]] = None
 
     @model_validator(mode="after")
     def bounded_host_data(self):
         if self.host_tools or self.serial_host_tools:
-            if self.mode != "paper" or len(set(self.host_tools)) != len(self.host_tools):
-                raise ValueError("Host tools require a unique Paper manifest")
+            if not is_proposal_context(self.model_dump()) or len(set(self.host_tools)) != len(self.host_tools):
+                raise ValueError("Host tools require a unique proposal-only manifest")
             if any(not name.isidentifier() or len(name) > 64 for name in self.host_tools):
                 raise ValueError("Invalid host tool name")
             if not set(self.serial_host_tools) <= set(self.host_tools):
@@ -76,7 +77,13 @@ class InteractionContext(BaseModel):
         return self
 
 
-_delivery: ContextVar[Optional[Callable[[dict, str, Optional[dict], Optional[dict]], None]]] = ContextVar(
+def is_proposal_context(context: Optional[dict]) -> bool:
+    """Paper's legacy policy and explicit Live policy share the same restrictions."""
+    return bool(context and (context.get("mode") == "paper" or
+                             context.get("execution_policy") == "proposal_only"))
+
+
+_delivery: ContextVar[Optional[Callable[[dict, str, Optional[dict], Optional[dict]], Optional[dict]]]] = ContextVar(
     "current_interactive_delivery", default=None,
 )
 _context: ContextVar[Optional[dict]] = ContextVar("current_interaction_context", default=None)
@@ -87,7 +94,7 @@ def current_message_scope(deliver: Callable, context: Optional[dict] = None, *, 
     delivery_token = _delivery.set(deliver)
     context_token = _context.set(deepcopy(context))
     try:
-        with proposal_only_scope(bool(context and context.get("mode") == "paper"),
+        with proposal_only_scope(is_proposal_context(context),
                                  host_tools=(context or {}).get("host_tools", ()),
                                  available_tools=available_tools):
             yield
@@ -118,18 +125,28 @@ def send_current_message(text: str, reply_markup=None, metadata=None) -> dict:
                 raise ValueError("Metadata too large")
             metadata = json.loads(encoded)
         except (ValueError, TypeError, RecursionError):
-            return {"error": "Host metadata must be a finite JSON object of at most 32768 bytes"}
+            return {"success": False, "code": "HOST_METADATA_INVALID",
+                    "error": "Host metadata must be a finite JSON object of at most 32768 bytes",
+                    "publication": {"status": "not_attempted"},
+                    "failure": {"category": "invalid_request", "recovery": "correct_request",
+                                "retrySameInput": False, "fields": [{"path": "metadata", "code": "invalid_type",
+                                "message": "Pass a finite JSON object, not a JSON-encoded string. Correct the object before publishing again."}]}}
     deliver = _delivery.get()
     if deliver is None:
         return {"error": "No current conversation delivery is available in this execution context"}
     message_id = f"msg_{uuid4().hex}"
     # The caller owns delivery; do not fall back to another channel on failure.
     try:
-        registered = deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
+        receipt = deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
+        if isinstance(receipt, dict):
+            if receipt.get("success") is not True:
+                return receipt
+            message_id = receipt.get("message_id", message_id)
     except Exception:
         return {"error": "Current conversation delivery is unavailable; no other channel was used"}
-    presentation = ({key: registered[key] for key in ("context", "coachCard", "callbackScope")
-                     if key in registered} if isinstance(registered, dict) else
-                    ({"context": current_interaction_context()} if _context.get() is not None else {}))
     return {"success": True, "message_id": message_id, "message": message,
-            **({"metadata": metadata} if metadata is not None else {}), **presentation}
+            **({key: receipt[key] for key in ("publication", "duplicate", "coachCard", "callbackScope") if key in receipt}
+               if isinstance(receipt, dict) else {}),
+            **({"metadata": metadata} if metadata is not None else {}),
+            **({"context": receipt["context"]} if isinstance(receipt, dict) and "context" in receipt else
+               {"context": current_interaction_context()} if _context.get() is not None else {})}

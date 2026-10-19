@@ -27,20 +27,24 @@ class HostAgent:
     session_prompt_tokens = session_completion_tokens = session_total_tokens = 0
     valid_tool_names = {"test_host_read", "skills_list", "skill_view"}
 
+    def __init__(self, arguments=None):
+        self.arguments = arguments or {}
+
     def run_conversation(self, **kwargs):
         from model_tools import handle_function_call
-        self.result = json.loads(handle_function_call("test_host_read", {}))
+        self.result = json.loads(handle_function_call("test_host_read", self.arguments))
         return {"final_response": "done"}
 
 
 @pytest.mark.asyncio
-async def test_authenticated_native_result_resolves_one_original_run(host_plugin):
+@pytest.mark.parametrize("policy", [{}, {"mode": "live", "execution_policy": "proposal_only"}])
+async def test_authenticated_native_result_resolves_one_original_run(host_plugin, policy):
     adapter, agent = _make_adapter("test-key"), HostAgent()
     headers = {"Authorization": "Bearer test-key"}
     with patch.object(adapter, "_create_agent", return_value=agent):
         async with TestClient(TestServer(_interactive_app(adapter))) as client:
             response = await client.post("/v1/runs", headers=headers, json={
-                "input": "Read", "interaction_context": {**context(), "host_tools": [host_plugin]}})
+                "input": "Read", "interaction_context": {**context(), **policy, "host_tools": [host_plugin]}})
             assert response.status == 202, await response.text()
             run_id = (await response.json())["run_id"]
             stream = await client.get(f"/v1/runs/{run_id}/events", headers=headers)
@@ -57,9 +61,35 @@ async def test_authenticated_native_result_resolves_one_original_run(host_plugin
             assert (await client.post(route.replace(run_id, "other-run"), headers=headers, json=reply)).status == 404
             assert (await client.post(route, headers=headers, json=reply)).status == 200
             await settle(adapter, run_id)
+            assert adapter._create_agent.call_args.kwargs["proposal_only"] is True
             assert agent.result["data"]["balance"] == "100"
             assert agent.result["callId"] == event["callId"]
             stream.release()
+
+
+@pytest.mark.asyncio
+async def test_live_host_manifest_requires_explicit_proposal_policy(host_plugin):
+    adapter = _make_adapter("test-key")
+    async with TestClient(TestServer(_interactive_app(adapter))) as client:
+        response = await client.post("/v1/runs", headers={"Authorization": "Bearer test-key"}, json={
+            "input": "Read", "interaction_context": {**context(), "mode": "live", "host_tools": [host_plugin]}})
+        assert response.status == 400
+        assert not adapter._active_run_tasks
+
+
+def test_live_proposal_scope_blocks_native_execution_and_preserves_metadata(host_plugin):
+    from gateway.interactive_messages import current_message_scope, send_current_message
+    from tools.execution_scope import execution_scope_error
+    delivered = []
+    metadata = {"coachCard": {"version": 1, "kind": "paper_practice_invite", "title": "Practise BTC"}}
+    with current_message_scope(lambda *args: delivered.append(args), {
+        **context(), "mode": "live", "execution_policy": "proposal_only", "host_tools": [host_plugin]
+    }):
+        assert json.loads(execution_scope_error("terminal"))["error_type"] == "proposal_only"
+        assert execution_scope_error(host_plugin) is None
+        assert send_current_message("Practise first", metadata=metadata)["metadata"] == metadata
+    assert delivered[0][3] == metadata
+    assert execution_scope_error("terminal") is None
 
 
 @pytest.mark.asyncio
@@ -84,23 +114,36 @@ def test_scoped_schema_cache_cannot_restore_broad_tools(host_plugin):
     assert {t["function"]["name"] for t in second} == {"skill_view"}
 
 @pytest.mark.asyncio
-async def test_stop_releases_host_wait_without_native_or_channel_fallback(host_plugin):
-    adapter, agent = _make_adapter("test-key"), HostAgent()
+@pytest.mark.parametrize("platform_run_id", [None, "platform-original-run"])
+async def test_stop_releases_host_wait_without_native_or_channel_fallback(host_plugin, platform_run_id):
+    adapter, agent = _make_adapter("test-key"), HostAgent({"runId": "model-forged-run"})
     headers = {"Authorization": "Bearer test-key"}
+    interaction_context = {**context(), "host_tools": [host_plugin]}
+    if platform_run_id is not None:
+        interaction_context["context_id"] = platform_run_id
     with patch.object(adapter, "_create_agent", return_value=agent):
         async with TestClient(TestServer(_interactive_app(adapter))) as client:
             response = await client.post("/v1/runs", headers=headers, json={"input": "Read",
-                "interaction_context": {**context(), "host_tools": [host_plugin]}})
+                "interaction_context": interaction_context})
+            assert response.status == 202, await response.text()
             run_id = (await response.json())["run_id"]
             stream = await client.get(f"/v1/runs/{run_id}/events", headers=headers)
             while True:
                 line = await asyncio.wait_for(stream.content.readline(), 5)
-                if line.startswith(b"data:") and json.loads(line[5:]).get("event") == "host_tool.request":
-                    break
+                if line.startswith(b"data:"):
+                    event = json.loads(line[5:])
+                    if event.get("event") == "host_tool.request":
+                        break
+            assert event["run_id"] == run_id
             task = adapter._active_run_tasks[run_id]
             assert (await client.post(f"/v1/runs/{run_id}/stop", headers=headers)).status == 200
             await asyncio.wait_for(task, 2)
-            assert agent.result["error"]["code"] == "HOST_CALL_CANCELLED"
+            expected = {"status": "error", "error": {"code": "HOST_CALL_CANCELLED"},
+                        "callId": event["callId"]}
+            if platform_run_id is not None:
+                assert platform_run_id != run_id
+                expected["runId"] = platform_run_id
+            assert agent.result == expected
             assert run_id not in adapter._run_host_tools
             stream.release()
 
@@ -184,15 +227,14 @@ def test_publication_proxy_has_its_own_opt_in_and_budget_without_exposing_an_age
     def publish(request):
         requests.append(request)
         broker.resolve(request['callId'], request['requestHash'], {'status': 'ready'})
-    broker = HostToolBroker('run', ['test_host_read'], publish, publication_ack=True, timeout=0.05)
+    broker = HostToolBroker('run', ['test_host_read', '__publish_current_message'], publish, timeout=0.05)
     large = {'message': {'text': 'x' * 60000}}
     assert broker.call('__publish_current_message', large)['status'] == 'ready'
-    assert '__publish_current_message' not in broker.names
     assert broker.call('test_host_read', large)['error']['code'] == 'HOST_REQUEST_INVALID'
     assert broker.call('__publish_current_message', {'value': 'x' * 65536})['error']['code'] == 'HOST_REQUEST_INVALID'
     disabled = HostToolBroker('run', [], lambda request: pytest.fail('Unadmitted publication'), timeout=0.05)
     assert disabled.call('__publish_current_message', {})['error']['code'] == 'HOST_TOOL_UNAVAILABLE'
-    expired = HostToolBroker('run', [], lambda request: None, publication_ack=True, timeout=0.01)
+    expired = HostToolBroker('run', ['__publish_current_message'], lambda request: None, timeout=0.01)
     assert expired.call('__publish_current_message', {})['error']['code'] == 'HOST_CALL_UNKNOWN'
     broker.close()
     assert broker.call('__publish_current_message', {})['error']['code'] == 'HOST_CALL_CANCELLED'
