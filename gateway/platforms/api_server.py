@@ -3816,6 +3816,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_streaming": True,
                 "run_submission": True,
                 "runs_idempotency_lookup": True,
+                "session_run_provenance": True,
                 "runs_idempotency": {
                     "supported": True,
                     "durable": self._run_idempotency_store.durable,
@@ -4003,7 +4004,15 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        payload = {key: message.get(key) for key in safe_keys if key in message}
+        metadata = message.get("display_metadata")
+        run = metadata.get("api_run") if isinstance(metadata, dict) else None
+        if (message.get("role") == "user" and isinstance(run, dict)
+                and isinstance(run.get("id"), str) and re.fullmatch(r"run_[0-9a-f]{32}", run["id"])
+                and isinstance(run.get("idempotency_key"), str)
+                and re.fullmatch(r"[\x21-\x7e]{1,255}", run["idempotency_key"])):
+            payload["api_run"] = {"id": run["id"], "idempotency_key": run["idempotency_key"]}
+        return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -7611,6 +7620,9 @@ class APIServerAdapter(BasePlatformAdapter):
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                **({"persist_user_display_metadata": {"api_run": {
+                                    "id": run_id, "idempotency_key": idempotency_key,
+                                }}} if idempotency_key else {}),
                                 **({"reload_session_history": True} if native_session_continuation else {}),
                             )
                         finally:

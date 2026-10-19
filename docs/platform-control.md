@@ -37,3 +37,18 @@ Confidential images set `HERMES_ENV_LITERAL_VALUES=1` before starting Hermes.
 In this mode dotenv loading preserves literal `${...}` text and opaque UTF-8
 credential values, without environment interpolation or ASCII credential
 sanitization. Ordinary profiles retain their existing dotenv behavior.
+
+## Durable native turn provenance
+
+For an idempotent `POST /v1/runs`, the server stamps the current user message
+with `display_metadata.api_run = {id, idempotency_key}` at the normal turn-start
+persist. The IDs come from the authenticated native admission. An ordinary user
+message remains an ordinary user message; provenance does not change its text,
+model input or display kind. Existing SessionDB storage and backups retain it.
+
+Authenticated `/api/sessions/{session_id}/messages` exposes that bounded object
+as `api_run` on user rows. It exposes no other display metadata. Capability
+`session_run_provenance` names this contract. Shared TEE News uses the exact
+idempotency key to associate follow-up replies after supervisor restart, including
+identical successive inputs. It never guesses by text, timestamp or position;
+compacted-away rows provide no turn evidence. This adds no run-retention lease.
