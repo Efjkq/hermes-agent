@@ -3829,6 +3829,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "interactive_messages": True,
+                "publication_ack_v1": True,
                 "paper_proposal_only": True,
                 "host_tools_v1": True,
                 "host_tool_names": self._available_host_tools(),
@@ -7240,6 +7241,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if not isinstance(body, dict):
             return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+        publication_ack = body.get("publication_ack", False)
+        if type(publication_ack) is not bool or (publication_ack and not self._expected_api_key()):
+            return web.json_response(_openai_error("Publication acknowledgement requires a boolean flag and configured authentication",
+                                     code="invalid_publication_ack"), status=400)
         idempotency_key = request.headers.get("Idempotency-Key", "").strip()
         from gateway.interactive_messages import InteractionContext, current_message_scope
         interaction_context = None
@@ -7480,7 +7485,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 from gateway.host_tools import HostToolBroker, host_tool_scope
                 host_broker = HostToolBroker(run_id, host_tool_names, _publish_interactive,
-                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()))
+                    serial_tools=(interaction_context or {}).get("serial_host_tools", ()),
+                    publication_ack=publication_ack)
                 self._run_host_tools[run_id] = host_broker
 
                 def _clarify(question, choices=None, multi_select=False):
@@ -7580,12 +7586,29 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     effective_task_id = session_id or run_id
                     def _deliver_current(message, message_id, context, metadata=None):
+                        registered = None
+                        if publication_ack:
+                            receipt = host_broker.call("__publish_current_message", {
+                                "success": True, "message_id": message_id, "message": message,
+                                **({"metadata": metadata} if metadata is not None else {}),
+                            })
+                            proof = receipt.get("publication", {})
+                            registered = receipt.get("registered")
+                            if (receipt.get("status") != "ready" or not isinstance(proof, dict)
+                                    or proof.get("status") != "registered" or proof.get("messageId") != message_id
+                                    or not isinstance(registered, dict)):
+                                raise RuntimeError("Current conversation registration is unavailable")
+                        presentation = ({key: registered[key] for key in ("coachCard", "callbackScope", "context")
+                                         if key in registered} if registered is not None else {})
                         _publish_interactive({
                             "event": "message.interactive", "run_id": run_id,
                             "timestamp": time.time(), "message_id": message_id,
-                            "message": message, "context": context,
+                            "message": message,
+                            "context": presentation.get("context") if publication_ack else context,
+                            **presentation,
                             **({"metadata": metadata} if metadata is not None else {}),
                         })
+                        return {"context": presentation.get("context"), **presentation} if publication_ack else None
                     approval_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile), current_message_scope(

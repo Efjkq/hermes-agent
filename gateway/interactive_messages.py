@@ -125,9 +125,11 @@ def send_current_message(text: str, reply_markup=None, metadata=None) -> dict:
     message_id = f"msg_{uuid4().hex}"
     # The caller owns delivery; do not fall back to another channel on failure.
     try:
-        deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
+        registered = deliver(deepcopy(message), message_id, current_interaction_context(), deepcopy(metadata))
     except Exception:
         return {"error": "Current conversation delivery is unavailable; no other channel was used"}
+    presentation = ({key: registered[key] for key in ("context", "coachCard", "callbackScope")
+                     if key in registered} if isinstance(registered, dict) else
+                    ({"context": current_interaction_context()} if _context.get() is not None else {}))
     return {"success": True, "message_id": message_id, "message": message,
-            **({"metadata": metadata} if metadata is not None else {}),
-            **({"context": current_interaction_context()} if _context.get() is not None else {})}
+            **({"metadata": metadata} if metadata is not None else {}), **presentation}

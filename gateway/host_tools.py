@@ -28,8 +28,9 @@ class HostCallInactive(LookupError):
 
 
 class HostToolBroker:
-    def __init__(self, run_id, names, publish, *, serial_tools=(), timeout=15):
+    def __init__(self, run_id, names, publish, *, serial_tools=(), timeout=15, publication_ack=False):
         self.run_id = run_id
+        self.publication_ack = publication_ack
         self.names = frozenset(names)
         self.serial_tools = frozenset(serial_tools)
         if not self.serial_tools <= self.names or not 0 < timeout <= 15:
@@ -44,16 +45,17 @@ class HostToolBroker:
         self._closed = False
 
     def call(self, name, arguments):
-        if name not in self.names:
+        publication = name == "__publish_current_message" and self.publication_ack
+        if name not in self.names and not publication:
             return _error("HOST_TOOL_UNAVAILABLE")
         try:
-            encoded = _encoded(arguments, 8192)
+            encoded = _encoded(arguments, 65536 if publication else 8192)
         except (ValueError, TypeError, RecursionError):
             return _error("HOST_REQUEST_INVALID")
         call_id = uuid4().hex
         request_hash = hashlib.sha256((name + "\n" + encoded).encode("utf-8")).hexdigest()
         started = time.monotonic()
-        slot = self._serial if name in self.serial_tools else self._reads
+        slot = self._serial if publication or name in self.serial_tools else self._reads
         if not slot.acquire(timeout=self.timeout):
             return _error("HOST_CALL_NOT_STARTED", call_id)
         entry = {"event": threading.Event(), "hash": request_hash, "reply": None}

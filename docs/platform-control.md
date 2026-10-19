@@ -52,3 +52,20 @@ as `api_run` on user rows. It exposes no other display metadata. Capability
 idempotency key to associate follow-up replies after supervisor restart, including
 identical successive inputs. It never guesses by text, timestamp or position;
 compacted-away rows provide no turn evidence. This adds no run-retention lease.
+
+
+## Current-conversation publication registration
+
+`GET /v1/capabilities` advertises `publication_ack_v1`. A caller may opt in
+with the strict boolean `publication_ack: true` on `POST /v1/runs`; configured
+API bearer authentication is required. The normal unopted delivery remains
+unchanged. `send_message(target="current")` then emits a bounded internal
+`__publish_current_message` host request and waits for authenticated registration
+through the existing host-result endpoint before emitting `message.interactive`.
+A rejected, expired or cancelled registration never falls back to another channel
+and never publishes the unregistered message. This transport operation is not
+added to the model's tool manifest. Its request budget is 64 KiB; ordinary host
+tools retain 8 KiB and all results retain 32 KiB. Only registered card, context
+and callback references are added to the delivered message and saved tool result.
+The hosting service must persist those references before acknowledging; this
+native protocol does not grant financial execution authority.
