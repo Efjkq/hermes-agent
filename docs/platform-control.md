@@ -32,3 +32,8 @@ back to follow. Cursors bind the opened file's device, inode and byte position,
 restart on rotation or truncation, and retain incomplete lines for the next
 read. Symbolic links and non-regular files refuse. The owner-authorizing
 controller must stream answers without persisting or logging their contents.
+
+Confidential images set `HERMES_ENV_LITERAL_VALUES=1` before starting Hermes.
+In this mode dotenv loading preserves literal `${...}` text and opaque UTF-8
+credential values, without environment interpolation or ASCII credential
+sanitization. Ordinary profiles retain their existing dotenv behavior.
