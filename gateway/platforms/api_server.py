@@ -2063,6 +2063,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/internal/platform/gateway/status", self._handle_internal_gateway_status),
             ("POST", "/internal/platform/runtime-sync", self._handle_internal_runtime_sync),
+            ("POST", "/internal/platform/pairing/{operation}", self._handle_internal_pairing),
+            ("POST", "/internal/platform/logs/tail", self._handle_internal_logs_tail),
             ("GET", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/telegram/approved-users", self._handle_internal_telegram_approved_users),
             ("POST", "/internal/platform/gateway/reload", self._handle_internal_gateway_reload),
@@ -3452,6 +3454,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "version": _hermes_version(),
             "pid": os.getpid(),
             "processMarker": self._platform_process_marker(),
+            "stateProcessMarker": f"{runtime.get('pid')}:{runtime.get('start_time')}",
             "gatewayState": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
             "updatedAt": runtime.get("updated_at"),
@@ -3490,6 +3493,85 @@ class APIServerAdapter(BasePlatformAdapter):
             "written": written,
             "reloadRecommended": bool(written),
         })
+
+    async def _handle_internal_logs_tail(self, request: "web.Request") -> "web.Response":
+        """Bounded gateway log tail; never accepts a path or command."""
+        if not self._expected_api_key():
+            return web.json_response(_openai_error("API_SERVER_KEY is required"), status=401)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        from gateway.platform_logs import read_gateway_log
+        from hermes_constants import get_hermes_home
+        try:
+            return web.json_response(read_gateway_log(Path(get_hermes_home()), body))
+        except ValueError:
+            return web.json_response(_openai_error("Invalid log operation"), status=400)
+        except OSError:
+            return web.json_response(_openai_error("Log source unavailable"), status=503)
+
+    async def _handle_internal_pairing(self, request: "web.Request") -> "web.Response":
+        """Closed pairing operations for hosted controllers without container exec.
+
+        Grants discovered here are projected back from the platform's durable
+        configuration. No request selects a file, profile or command.
+        """
+        if not self._expected_api_key():
+            return web.json_response(_openai_error("API_SERVER_KEY is required"), status=401)
+        auth_err = self._check_auth(request)
+        if auth_err is not None:
+            return auth_err
+        operation = request.match_info["operation"]
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+        if not isinstance(body, dict) or body.get("channel") not in ("telegram", "line"):
+            return web.json_response(_openai_error("Invalid pairing channel"), status=400)
+        channel = body["channel"]
+        if operation == "approve":
+            if set(body) != {"channel", "code"} or not isinstance(body["code"], str) or not re.fullmatch(r"[A-Z0-9]{8}", body["code"]):
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        elif operation == "allow-from":
+            if set(body) != {"channel"}:
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        elif operation == "revoke":
+            mode = body.get("mode")
+            expected = {"channel", "mode", "entry"} if mode == "entry" else {"channel", "mode"}
+            if mode not in ("entry", "account", "requests") or set(body) != expected or (mode == "entry" and
+                    (not isinstance(body["entry"], str) or not re.fullmatch(r"[\x21-\x7e]{1,128}", body["entry"]))):
+                return web.json_response(_openai_error("Invalid pairing operation"), status=400)
+        else:
+            return web.json_response(_openai_error("Unknown pairing operation"), status=404)
+        store = self._platform_pairing_store()
+        # The gateway's one store lock fences concurrent adapter approvals.
+        with store._lock:
+            if operation == "approve":
+                try:
+                    result = store.approve_code(channel, body["code"])
+                except Exception:
+                    # The grant may already be durable before a mirror update
+                    # fails. The controller must reconcile, never infer refusal.
+                    return web.json_response({"status": "incomplete"})
+                if result is None:
+                    return web.json_response({"status": "not_found"})
+            elif operation == "revoke":
+                removed = 0
+                if mode == "entry":
+                    removed = int(store.revoke(channel, body["entry"]))
+                elif mode == "account":
+                    for user in store.list_approved(channel):
+                        removed += int(store.revoke(channel, user["user_id"]))
+                pending = store.clear_pending(channel, body.get("entry") if mode == "entry" else None)
+            allow_from = [user["user_id"] for user in store.list_approved(channel)]
+        if operation == "revoke":
+            return web.json_response({"changed": bool(removed or pending), "removedAllowFromCount": removed,
+                                      "removedRequestCount": pending, "allowFrom": allow_from})
+        if operation == "approve":
+            return web.json_response({"status": "approved", "allowFrom": allow_from})
+        return web.json_response({"allowFrom": allow_from})
 
     async def _handle_internal_telegram_approved_users(self, request: "web.Request") -> "web.Response":
         """GET/POST /internal/platform/telegram/approved-users."""
