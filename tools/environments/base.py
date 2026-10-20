@@ -612,8 +612,10 @@ class BaseEnvironment(ABC):
         if not self._profile_scoped_passthrough:
             return ()
         try:
-            from agent.secret_scope import is_multiplex_active
-            if is_multiplex_active():
+            from agent.secret_scope import current_secret_scope, is_multiplex_active
+            # Single-profile execution middleware can supply ephemeral secrets
+            # too. They must neither persist nor be replaced by an old snapshot.
+            if is_multiplex_active() or current_secret_scope() is not None:
                 from tools.env_passthrough import get_all_passthrough
                 names = (
                     *get_all_passthrough(),
