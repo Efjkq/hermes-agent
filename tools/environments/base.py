@@ -25,6 +25,7 @@ from typing import IO, Callable, Iterable, Protocol
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
+from agent.output_redaction import capture_output_redactor
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,7 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        self._output_redactor = capture_output_redactor()
 
     def _maybe_spill(self, text: str) -> None:
         """Tee ``text`` to the spill file (opened lazily on first overflow)."""
@@ -131,45 +133,56 @@ class _BoundedOutputCollector:
         if not text:
             return
         with self._lock:
-            text_len = len(text)
-            # Spill tee: activates at the first overflow (backfilling what's
-            # retained so far), then mirrors every subsequent chunk.
-            if self._spill_path is not None and (
-                self._spill_fh is not None
-                or self._total_chars + text_len > self.max_chars
-            ):
-                self._maybe_spill(text)
-            self._total_chars += text_len
-            start = 0
+            if self._output_redactor is not None:
+                text = self._output_redactor.feed(text)
+            self._append_text(text)
 
-            if self._head_chars < self._head_limit:
-                take = min(self._head_limit - self._head_chars, text_len)
-                if take:
-                    self._head.append(text[:take])
-                    self._head_chars += take
-                    start = take
+    def finish(self) -> None:
+        """Finish filtering at EOF, before rendering or closing the spill."""
+        with self._lock:
+            if self._output_redactor is not None:
+                self._append_text(self._output_redactor.finish())
 
-            remaining = text_len - start
-            if remaining <= 0 or self._tail_limit <= 0:
-                return
-            if remaining >= self._tail_limit:
-                self._tail.clear()
-                self._tail.append(text[-self._tail_limit :])
-                self._tail_chars = self._tail_limit
-                return
+    def _append_text(self, text: str) -> None:
+        text_len = len(text)
+        # Spill tee: activates at the first overflow (backfilling what's
+        # retained so far), then mirrors every subsequent chunk.
+        if self._spill_path is not None and (
+            self._spill_fh is not None
+            or self._total_chars + text_len > self.max_chars
+        ):
+            self._maybe_spill(text)
+        self._total_chars += text_len
+        start = 0
 
-            chunk = text[start:]
-            self._tail.append(chunk)
-            self._tail_chars += len(chunk)
-            while self._tail_chars > self._tail_limit:
-                excess = self._tail_chars - self._tail_limit
-                first = self._tail[0]
-                if len(first) <= excess:
-                    self._tail.popleft()
-                    self._tail_chars -= len(first)
-                else:
-                    self._tail[0] = first[excess:]
-                    self._tail_chars -= excess
+        if self._head_chars < self._head_limit:
+            take = min(self._head_limit - self._head_chars, text_len)
+            if take:
+                self._head.append(text[:take])
+                self._head_chars += take
+                start = take
+
+        remaining = text_len - start
+        if remaining <= 0 or self._tail_limit <= 0:
+            return
+        if remaining >= self._tail_limit:
+            self._tail.clear()
+            self._tail.append(text[-self._tail_limit :])
+            self._tail_chars = self._tail_limit
+            return
+
+        chunk = text[start:]
+        self._tail.append(chunk)
+        self._tail_chars += len(chunk)
+        while self._tail_chars > self._tail_limit:
+            excess = self._tail_chars - self._tail_limit
+            first = self._tail[0]
+            if len(first) <= excess:
+                self._tail.popleft()
+                self._tail_chars -= len(first)
+            else:
+                self._tail[0] = first[excess:]
+                self._tail_chars -= excess
 
     def render(self, *, suffix: str = "") -> str:
         """Render within ``max_chars``, preserving a required status suffix."""
@@ -1000,6 +1013,7 @@ class BaseEnvironment(ABC):
                         output.append(tail)
                 except Exception:
                     pass
+                output.finish()
 
         def _drain():
             # Resolve a real OS file descriptor up front.  Real subprocesses and
@@ -1038,6 +1052,7 @@ class BaseEnvironment(ABC):
                             output.append(tail)
                     except Exception:
                         pass
+                    output.finish()
                 return
             idle_after_exit = 0
             try:
@@ -1072,6 +1087,7 @@ class BaseEnvironment(ABC):
                         output.append(tail)
                 except Exception:
                     pass
+                output.finish()
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
