@@ -118,3 +118,36 @@ def test_nonlocal_background_capture_fails_before_writing_raw_logs():
     with secret_output_scope(['opaque-secret']):
         with pytest.raises(ValueError, match='local execution'):
             ProcessRegistry().spawn_via_env(Remote(), 'echo data')
+
+
+@pytest.mark.parametrize('exit_code', [0, 7])
+def test_execute_code_sanitizes_stdout_stderr_and_json_escaped_passphrases(monkeypatch, exit_code):
+    from agent.output_redaction import secret_output_scope
+    from tools.env_passthrough import register_env_passthrough, clear_env_passthrough
+    from tools.code_execution_tool import execute_code
+
+    secret = 'opaque"passphrase\\with-unicode-雪'
+    monkeypatch.setenv('TERMINAL_ENV', 'local')
+    monkeypatch.setenv('OKX_CEX_PASSPHRASE', secret)
+    register_env_passthrough(['OKX_CEX_PASSPHRASE'])
+    code = """import os,json,sys
+value=os.environ['OKX_CEX_PASSPHRASE']
+print('stdout:' + value)
+print(json.dumps({'message': value}))
+print('stderr:' + value, file=sys.stderr)
+"""
+    code += f'\nsys.exit({exit_code})\n'
+    try:
+        with secret_output_scope([secret]):
+            result = json.loads(execute_code(code, enabled_tools=[]))
+        assert result['status'] == ('error' if exit_code else 'success')
+        assert result['exit_code'] == exit_code
+        expected = 'stdout:[REDACTED]\n{"message": "[REDACTED]"}\n'
+        if exit_code:
+            expected += '\n--- stderr ---\nstderr:[REDACTED]\n'
+            assert result['error'] == 'stderr:[REDACTED]\n'
+        assert result['output'] == expected
+        assert secret not in json.dumps(result, ensure_ascii=False)
+        assert secret not in str(result)
+    finally:
+        clear_env_passthrough()

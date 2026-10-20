@@ -20,7 +20,9 @@ with the exact opaque values being delivered. Local background processes capture
 independent stream filters before their reader threads start. Filtering happens
 before buffers, live observers, watch notifications, process poll/log/wait and
 completion messages. It handles values split across pipe/PTY chunks and EOF;
-foreground head/tail truncation and spill files use the same filter. Command and
+foreground head/tail truncation and spill files use the same filter. Local
+execute_code stdout/stderr are filtered independently before byte budgets or JSON
+serialization; standard JSON-escaped secret values are matched too. Command and
 persisted watch metadata are sanitized as well. No global environment scan or
 network lookup is used. Each filter releases its matching values at stream EOF,
 so a running child remains protected after the caller or signing session ends.
