@@ -411,3 +411,23 @@ class TestTerminalIntegration:
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env
         assert child_env["PATH"] == "/usr/bin"
+
+
+def test_single_profile_secret_scope_does_not_persist_or_restore_stale_snapshot(monkeypatch, tmp_path):
+    from pathlib import Path
+    from tools.environments.local import LocalEnvironment
+
+    register_env_passthrough(['SERVICE_TOKEN'])
+    monkeypatch.setenv('SERVICE_TOKEN', 'placeholder')
+    environment = LocalEnvironment(cwd=str(tmp_path))
+    try:
+        for value in ('session-a', 'session-b'):
+            token = ss.set_secret_scope({'SERVICE_TOKEN': value})
+            try:
+                assert environment.execute('printf %s "$SERVICE_TOKEN"')['output'] == value
+                assert value not in Path(environment._snapshot_path).read_text()
+            finally:
+                ss.reset_secret_scope(token)
+        assert environment.execute('printf %s "$SERVICE_TOKEN"')['output'] == 'placeholder'
+    finally:
+        environment.cleanup()

@@ -49,6 +49,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.thread_context import propagate_context_to_thread
+from agent.output_redaction import capture_output_redactor, iter_redacted_pipe
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
@@ -1328,6 +1329,8 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
+        if capture_output_redactor() is not None:
+            return tool_error("Scoped credential code execution requires local execution")
         return _execute_remote(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
@@ -1515,14 +1518,15 @@ def execute_code(
         _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
         _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
 
+        # Capture in the caller: ContextVars do not implicitly cross reader threads.
+        stdout_redactor = capture_output_redactor()
+        stderr_redactor = capture_output_redactor()
+
         def _drain(pipe, chunks, max_bytes):
             """Simple head-only drain (used for stderr)."""
             total = 0
             try:
-                while True:
-                    data = pipe.read(4096)
-                    if not data:
-                        break
+                for data in iter_redacted_pipe(pipe, stderr_redactor):
                     if total < max_bytes:
                         keep = max_bytes - total
                         chunks.append(data[:keep])
@@ -1539,10 +1543,7 @@ def execute_code(
             tail_buf = deque()
             tail_collected = 0
             try:
-                while True:
-                    data = pipe.read(4096)
-                    if not data:
-                        break
+                for data in iter_redacted_pipe(pipe, stdout_redactor):
                     total_ref[0] += len(data)
                     # Fill head buffer first
                     if head_collected < head_bytes:

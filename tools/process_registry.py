@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+from agent.output_redaction import capture_output_redactor, StreamingSecretRedactor
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,7 @@ class ProcessSession:
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
     _platform_activity_release: Optional[Callable[[], None]] = field(default=None, repr=False)
+    _output_redactor: Optional[StreamingSecretRedactor] = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -233,6 +235,22 @@ class ProcessRegistry:
             sink(session, chunk)
         except Exception:
             pass
+
+    def _append_output(self, session: ProcessSession, text: str, *, final: bool = False) -> None:
+        # Sanitize before every consumer: the buffer, live UI, watch matches,
+        # poll/log/wait and completion notifications share this same stream.
+        if session._output_redactor is not None:
+            if final:
+                # Metadata can outlive the output stream and its secret set.
+                session.watch_patterns = [session._output_redactor.redact_text(value)
+                                          for value in session.watch_patterns]
+            text = session._output_redactor.feed(text, final=final)
+        if not text:
+            return
+        with session._lock:
+            session.output_buffer = (session.output_buffer + text)[-session.max_output_chars:]
+        self._check_watch_patterns(session, text)
+        self._emit_output(session, text)
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -716,13 +734,15 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        redactor = capture_output_redactor()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
-            command=command,
+            command=redactor.redact_text(command) if redactor else command,
             task_id=task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            _output_redactor=redactor,
         )
         from gateway.platform_activity import reserve_platform_activity
         session._platform_activity_release = reserve_platform_activity()
@@ -869,6 +889,10 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
+        if capture_output_redactor() is not None:
+            # Non-local backends first write raw output to a sandbox log file.
+            # Managed Hosted scopes use local processes with pre-buffer filtering.
+            raise ValueError('Scoped credential background output requires local execution')
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -995,12 +1019,7 @@ class ProcessRegistry:
             if first_chunk:
                 chunk = self._clean_shell_noise(chunk)
                 first_chunk = False
-            with session._lock:
-                session.output_buffer += chunk
-                if len(session.output_buffer) > session.max_output_chars:
-                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
-            self._check_watch_patterns(session, chunk)
-            self._emit_output(session, chunk)
+            self._append_output(session, chunk)
 
         try:
             proc = session.process
@@ -1076,6 +1095,7 @@ class ProcessRegistry:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     _append_chunk(tail)
+                self._append_output(session, '', final=True)
             except Exception:
                 pass
             # Always reap the child to prevent zombie processes.
@@ -1156,12 +1176,7 @@ class ProcessRegistry:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         def _append_text(text: str):
-            with session._lock:
-                session.output_buffer += text
-                if len(session.output_buffer) > session.max_output_chars:
-                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
-            self._check_watch_patterns(session, text)
-            self._emit_output(session, text)
+            self._append_output(session, text)
 
         try:
             while pty.isalive():
@@ -1184,6 +1199,7 @@ class ProcessRegistry:
             tail = decoder.decode(b"", final=True)
             if tail:
                 _append_text(tail)
+            self._append_output(session, '', final=True)
         except Exception:
             pass
 
@@ -2132,7 +2148,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
+                            "watch_patterns": [s._output_redactor.redact_text(value) if s._output_redactor else value for value in s.watch_patterns],
                         })
             
             # Atomic write to avoid corruption on crash
