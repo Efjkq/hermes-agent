@@ -334,7 +334,7 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    from tools.execution_scope import proposal_available_tools, bound_host_tools
+    from tools.execution_scope import proposal_available_tools, bound_host_tools, compact_tool_disclosure
     scope_tools = proposal_available_tools()
     if scope_tools is not None:
         skip_tool_search_assembly = True
@@ -361,6 +361,7 @@ def get_tool_definitions(
                 profile_scope,
                 scope_tools,
                 bound_host_tools(),
+                compact_tool_disclosure(),
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
@@ -585,11 +586,9 @@ def _compute_tool_definitions(
         logger.warning("Schema sanitization skipped: %s", e)
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
-    # Conditionally replace MCP + plugin (non-core) tools with three bridge
-    # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
+    # Replace eligible tool schemas with tool_search / tool_describe / tool_call.
+    # Core tools stay eager by default; explicit compact presentation can defer
+    # them without changing authorization. See tools/tool_search.py.
     #
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in

@@ -2625,6 +2625,7 @@ class APIServerAdapter(BasePlatformAdapter):
         proposal_only: bool = False,
         host_tool_names: tuple[str, ...] = (),
         bound_business_tools: bool = False,
+        tool_disclosure: str = 'full',
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2953,7 +2954,7 @@ class APIServerAdapter(BasePlatformAdapter):
         allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
                    | set(host_tool_names)) if proposal_only else None
         from tools.execution_scope import host_tool_scope
-        with host_tool_scope(host_tool_names if bound_business_tools else ()), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
             agent = AIAgent(**agent_kwargs)
         if bound_business_tools:
             # Native assembly already keeps bound proxies/current delivery eager
@@ -3763,6 +3764,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "host_tools_v1": True,
                 "pawpilot_runtime_v2": True,
                 "workflow_skill_loading": True,
+                "workflow_resource_loading": True,
+                "compact_host_tools": True,
                 "plugin_capabilities": plugin_capabilities,
                 "publication_ack_v1": bool(self._expected_api_key()),
                 "host_tool_names": self._available_host_tools(),
@@ -7442,6 +7445,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
                         bound_business_tools=(interaction_context or {}).get("version") == 2,
+                        tool_disclosure=(interaction_context or {}).get('tool_disclosure') or 'full',
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,

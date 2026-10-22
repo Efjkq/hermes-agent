@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from typing import Callable, Literal, Optional
 from urllib.parse import urlsplit
+from pathlib import PurePosixPath
 from uuid import uuid4
 import json
 from tools.execution_scope import proposal_only_scope
@@ -49,6 +50,18 @@ class InlineKeyboard(BaseModel):
         return self
 
 
+class WorkflowResource(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    name: str = Field(min_length=1, max_length=128)
+    file_path: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode='after')
+    def relative_reference(self):
+        if PurePosixPath(self.file_path).is_absolute() or '..' in self.file_path.replace('\\', '/').split('/'):
+            raise ValueError('Workflow references must stay inside their installed Skill')
+        return self
+
+
 class InteractionContext(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     version: Literal[1, 2]
@@ -60,10 +73,16 @@ class InteractionContext(BaseModel):
     host_tools: list[str] = Field(default_factory=list, max_length=8)
     serial_host_tools: list[str] = Field(default_factory=list, max_length=8)
     workflow_skills: list[str] = Field(default_factory=list, max_length=3)
+    workflow_resources: list[WorkflowResource] = Field(default_factory=list, max_length=8)
+    tool_disclosure: Optional[Literal['full', 'compact']] = None
     execution_policy: Optional[Literal["proposal_only", "pawpilot"]] = None
 
     @model_validator(mode="after")
     def bounded_host_data(self):
+        if self.version != 2 and (self.workflow_resources or self.tool_disclosure is not None):
+            raise ValueError('Workflow references and compact disclosure require version 2')
+        if len({(r.name, r.file_path) for r in self.workflow_resources}) != len(self.workflow_resources):
+            raise ValueError('Duplicate workflow references')
         if self.workflow_skills and (self.version != 2 or len(set(self.workflow_skills)) != len(self.workflow_skills)
                                      or any(not 1 <= len(name) <= 128 for name in self.workflow_skills)):
             raise ValueError('Workflow skills require a bounded unique version-2 list')
@@ -103,7 +122,7 @@ def current_message_scope(deliver: Callable, context: Optional[dict] = None, *, 
     context_token = _context.set(deepcopy(context))
     try:
         from tools.execution_scope import host_tool_scope
-        with host_tool_scope((context or {}).get("host_tools", ()) if (context or {}).get("version") == 2 else ()), proposal_only_scope(is_proposal_context(context),
+        with host_tool_scope((context or {}).get("host_tools", ()) if (context or {}).get("version") == 2 else (), compact=(context or {}).get('tool_disclosure') == 'compact'), proposal_only_scope(is_proposal_context(context),
                                  host_tools=(context or {}).get("host_tools", ()),
                                  available_tools=available_tools):
             yield
@@ -124,20 +143,22 @@ def load_workflow_skill_context(context: Optional[dict], available_tools, task_i
     No CLI preprocessing, shell permission or financial operation is implied.
     """
     names = (context or {}).get('workflow_skills', ())
-    if not names:
+    resources = (context or {}).get('workflow_resources', ())
+    if not names and not resources:
         return ''
     if 'skill_view' not in available_tools:
         raise RuntimeError('Workflow skill loader unavailable')
     from tools.skills_tool import skill_view
     blocks = []
-    for name in names:
-        result = json.loads(skill_view(name, task_id=task_id, preprocess=False))
+    requested = [(name, None) for name in names] + [(r['name'], r['file_path']) for r in resources]
+    for name, file_path in dict.fromkeys(requested):
+        result = json.loads(skill_view(name, file_path=file_path, task_id=task_id, preprocess=False))
         content = result.get('content')
         if result.get('success') is not True or not isinstance(content, str) or not content:
             raise RuntimeError(f'Workflow skill unavailable: {name}')
-        blocks.append(f'## Installed workflow: {name}\n{content}')
+        blocks.append(f'## Installed workflow: {name}' + (f'/{file_path}' if file_path else '') + f'\n{content}')
     notes = ('[The following installed workflow Skills are already loaded for this request. '
-             'Use them when relevant without re-reading their main files. The user message '
+             'Use them when relevant without re-reading these files, including the supplied methods. The user message '
              'determines intent; a workflow hint never overrides an explicit user choice.]\n\n'
              + '\n\n'.join(blocks))
     if len(notes.encode('utf-8')) > 65536:

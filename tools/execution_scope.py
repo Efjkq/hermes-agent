@@ -50,17 +50,24 @@ def execution_scope_error(name: str):
 # Owner tool configuration remains authoritative; unlike proposal scope this
 # scope only exposes explicitly bound proxy schemas.
 _bound_host_tools = ContextVar("bound_current_host_tools", default=frozenset())
+_compact_tool_disclosure = ContextVar("compact_host_tool_disclosure", default=False)
 
 @contextmanager
-def host_tool_scope(names=()):
+def host_tool_scope(names=(), *, compact=False):
     from tools.registry import registry
     if any(registry.get_toolset_for_tool(name) != "api_host_tools" for name in names):
         raise ValueError("Host tools must be registered proxies")
     token = _bound_host_tools.set(frozenset(names))
+    disclosure_token = _compact_tool_disclosure.set(bool(compact))
     try:
         yield
     finally:
+        _compact_tool_disclosure.reset(disclosure_token)
         _bound_host_tools.reset(token)
 
 def bound_host_tools():
     return _bound_host_tools.get()
+
+def compact_tool_disclosure():
+    """Presentation only: original toolsets and execution permissions still apply."""
+    return _compact_tool_disclosure.get()
