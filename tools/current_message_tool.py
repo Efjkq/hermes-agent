@@ -14,7 +14,8 @@ from copy import deepcopy
 CURRENT_MESSAGE_SCHEMA = deepcopy(SEND_MESSAGE_SCHEMA)
 CURRENT_MESSAGE_SCHEMA['description'] = (
     "Send text and optional Telegram-compatible inline buttons to this API conversation only. "
-    "Before proposing any Terminal action, use action='context' to read its bound page mode and account. "
+    "Use action='context' only when the bound context is needed and not already supplied. "
+    "Page context describes the UI; it does not restrict task targets. "
     "A button is display data: host metadata may propose typed actions, but the host validates and registers them; "
     "financial actions always need the user's separate review and confirmation."
 )
@@ -22,7 +23,7 @@ CURRENT_MESSAGE_SCHEMA['parameters'] = {
     'type': 'object', 'properties': {
         'action': {'type': 'string', 'enum': ['send', 'context'], 'description': 'send publishes; context reads this run\'s trusted host context without delivery.'},
         'target': {'type': 'string', 'enum': ['current']},
-        'message': {'type': 'string', 'description': 'Plain text, 1–4096 characters. This current API transport has no attachment delivery.'},
+        'message': {'type': 'string', 'description': 'Required for send: plain text, 1–4096 characters. Use message, not text. This current API transport has no attachment delivery.'},
         'reply_markup': SEND_MESSAGE_SCHEMA['parameters']['properties']['reply_markup'],
         'metadata': SEND_MESSAGE_SCHEMA['parameters']['properties']['metadata'],
     }, 'additionalProperties': False,

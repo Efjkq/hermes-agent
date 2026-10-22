@@ -65,7 +65,12 @@ through the existing host-result endpoint before emitting `message.interactive`.
 A rejected, expired or cancelled registration never falls back to another channel
 and never publishes the unregistered message. This transport operation is not
 added to the model's tool manifest. Its request budget is 64 KiB; ordinary host
-tools retain 8 KiB and all results retain 32 KiB. Only registered card, context
-and callback references are added to the delivered message and saved tool result.
-The hosting service must persist those references before acknowledging; this
-native protocol does not grant financial execution authority.
+tools retain 8 KiB and all results retain 32 KiB. The acknowledgement's
+`registered` object must be a JSON object of at most 32 KiB, or registration is
+treated as unconfirmed. Only its card (`coachCard`), `context` and callback
+(`callbackScope`) references are added to the delivered message; without a
+registered context the message carries `context: null`, never the run context.
+The saved tool result carries those references at top level and the whole
+`registered` object, unchanged, so follow-up operations can name the original
+resource identities. The hosting service must persist those references before
+acknowledging; this native protocol does not grant financial execution authority.

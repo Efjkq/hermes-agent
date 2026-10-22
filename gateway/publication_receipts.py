@@ -87,6 +87,12 @@ class AcknowledgedPublisher:
                     registration = Registration.model_validate(result.get("publication"))
                     if result.get("status") != "ready" or registration.messageId != message_id:
                         raise ValueError("Mismatched registration")
+                    registered = result.get('registered', {})
+                    if not isinstance(registered, dict):
+                        raise ValueError('Invalid registered resources')
+                    encoded = json.dumps(registered, allow_nan=False, ensure_ascii=False)
+                    if len(encoded.encode('utf-8')) > 32768:
+                        raise ValueError('Registered resources too large')
                 except (ValueError, TypeError):
                     error = result.get("error") or {}
                     reason = result.get("reason") or (error.get("code") if isinstance(error, dict) else None)
@@ -104,20 +110,29 @@ class AcknowledgedPublisher:
                         entry["rejected"] = failed
                     return deepcopy(failed)
                 entry["registration"] = registration.model_dump(mode="json")
-                registered = result.get("registered")
-                if isinstance(registered, dict):
-                    entry["presentation"] = {"context": None, **{key: deepcopy(registered[key])
-                        for key in ("context", "coachCard", "callbackScope") if key in registered}}
+                # Opaque, bounded host acknowledgement (not model metadata).
+                # Follow-up operations need its original resource identities.
+                entry['registered'] = json.loads(encoded)
+                if "registered" in result:
+                    # Presentation is the allowlisted subset the visible message
+                    # carries. Without a registered context none is shown, never
+                    # the unregistered Run context.
+                    entry["presentation"] = {"context": None, **{key: deepcopy(entry["registered"][key])
+                        for key in ("context", "coachCard", "callbackScope") if key in entry["registered"]}}
             receipt = deepcopy(entry["registration"])
             try:
                 self._deliver(message, message_id, context, metadata,
-                    **({"registered": deepcopy(entry["presentation"])} if "presentation" in entry else {}))
+                    **({"presentation": deepcopy(entry["presentation"])} if "presentation" in entry else {}))
             except Exception:
                 return {"success": False, "message_id": message_id,
                         "error": "CURRENT_MESSAGE_DELIVERY_UNKNOWN", "publication": receipt,
                         "retrySameInput": True}
+            # The tool result keeps both: the presented card, callback scope and
+            # context at top level, and the whole acknowledgement as `registered`.
             delivered = {"success": True, "message_id": message_id, "publication": receipt,
                          **deepcopy(entry.get("presentation", {}))}
+            if entry.get('registered'):
+                delivered['registered'] = deepcopy(entry['registered'])
             if structured:
                 entry["delivered"] = delivered
             else:

@@ -147,6 +147,16 @@ def call_current_host_tool(name, arguments):
     broker = _current.get()
     if broker is None:
         return _error("HOST_TOOL_UNAVAILABLE")
-    return broker.call(name, arguments)
+    result = broker.call(name, arguments)
+    # Trusted platform output can carry a deterministic current-channel delivery
+    # envelope. The model never copies callbacks or business metadata. Legacy
+    # tools and other channels retain their existing explicit publication flow.
+    from gateway.interactive_messages import current_interaction_context, send_current_message
+    if (current_interaction_context() or {}).get("version") == 2 and result.get("status") == "ready" and isinstance(result.get("publish"), dict):
+        publication = result["publish"]
+        message = publication.get("message", {})
+        delivered = send_current_message(message.get("text", ""), message.get("reply_markup"), publication.get("metadata"), _message_id=publication.get("messageId"))
+        result = {**result, "publication": {"status": "registered" if delivered.get("success") else "unconfirmed", "messageId": publication.get("messageId"), "receipt": delivered.get("publication")}}
+    return result
 
 

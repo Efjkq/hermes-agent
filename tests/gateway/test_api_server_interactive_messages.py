@@ -458,7 +458,8 @@ async def test_publication_ack_waits_for_authenticated_registration_before_deliv
                           'publication': {'status': 'registered' if accepted else 'rejected',
                                           'messageId': publication['message_id'], 'runId': '00000000-0000-4000-8000-000000000001',
                                           'sessionId': '00000000-0000-4000-8000-000000000002', 'hash': 'b' * 64},
-                          'registered': {'coachCard': {'version': 1, 'id': 'card-id', 'kind': 'paper_practice_invite'}}}
+                          'registered': {'coachCard': {'version': 1, 'id': 'card-id', 'kind': 'paper_practice_invite'},
+                                         'resources': [{'kind': 'playbook', 'id': 'resource-id'}]}}
                 route = f"/v1/runs/{run_id}/host-tools/{event['callId']}/result"
                 wire = {'requestHash': event['requestHash'], 'result': result}
                 assert (await client.post(route, json=wire)).status == 401
@@ -469,6 +470,14 @@ async def test_publication_ack_waits_for_authenticated_registration_before_deliv
                 if accepted:
                     assert 'message.interactive' in rest
                     assert agent.results[0]['coachCard'] == result['registered']['coachCard']
+                    # The saved tool result keeps the whole acknowledgement; the
+                    # visible message carries only the registered presentation.
+                    assert agent.results[0]['registered'] == result['registered']
+                    shown = next(json.loads(line[5:]) for line in rest.splitlines()
+                                 if line.startswith('data:') and '"message.interactive"' in line)
+                    assert shown['coachCard'] == result['registered']['coachCard']
+                    assert shown['context'] is None
+                    assert 'registered' not in shown and 'resources' not in shown
                 else:
                     assert 'message.interactive' not in rest
                     assert 'error' in agent.results[0]

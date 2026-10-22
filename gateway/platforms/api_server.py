@@ -2627,6 +2627,8 @@ class APIServerAdapter(BasePlatformAdapter):
         interactive_messages: bool = False,
         proposal_only: bool = False,
         host_tool_names: tuple[str, ...] = (),
+        bound_business_tools: bool = False,
+        tool_disclosure: str = 'full',
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2914,6 +2916,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._validate_host_tools(host_tool_names)
                 enabled_toolsets.append("api_host_tools")
 
+        if bound_business_tools and host_tool_names:
+            self._validate_host_tools(host_tool_names)
+            enabled_toolsets.append("api_host_tools")
+
         max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
@@ -2950,8 +2956,13 @@ class APIServerAdapter(BasePlatformAdapter):
         from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES, proposal_only_scope
         allowed = ((PROPOSAL_ONLY_TOOL_NAMES & (owner_tool_names | {"send_message", "clarify"}))
                    | set(host_tool_names)) if proposal_only else None
-        with proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
+        from tools.execution_scope import host_tool_scope
+        with host_tool_scope(host_tool_names if bound_business_tools else (), compact=bound_business_tools and tool_disclosure == 'compact'), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
             agent = AIAgent(**agent_kwargs)
+        if bound_business_tools:
+            # Native assembly already keeps bound proxies/current delivery eager
+            # and sanitized. Do not append a second unsanitized catalog here.
+            agent._skip_mcp_refresh = True
         if proposal_only:
             from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES
             # The same exact scope was used while constructing the native prompt.
@@ -3792,6 +3803,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from hermes_cli.plugins import get_plugin_manager
+        plugin_capabilities = get_plugin_manager().api_capabilities(set(self._available_host_tools()))
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3833,6 +3847,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "paper_proposal_only": True,
                 "live_proposal_only": True,
                 "host_tools_v1": True,
+                "pawpilot_runtime_v2": True,
+                "workflow_skill_loading": True,
+                "workflow_resource_loading": True,
+                "compact_host_tools": True,
+                "plugin_capabilities": plugin_capabilities,
                 "publication_ack_v1": bool(self._expected_api_key()),
                 "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
@@ -7537,6 +7556,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         interactive_messages=True,
                         host_tool_names=host_tool_names,
                         proposal_only=is_proposal_context(interaction_context),
+                        bound_business_tools=(interaction_context or {}).get("version") == 2,
+                        tool_disclosure=(interaction_context or {}).get('tool_disclosure') or 'full',
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=_text_cb,
@@ -7669,15 +7690,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
 
                     effective_task_id = session_id or run_id
-                    def _deliver_current(message, message_id, context, metadata=None, *, registered=None):
-                        presentation = ({key: registered[key] for key in ("coachCard", "callbackScope", "context")
-                                         if key in registered} if registered is not None else {})
+                    def _deliver_current(message, message_id, context, metadata=None, *, presentation=None):
+                        # Only the host-registered presentation subset reaches the
+                        # visible message; the opaque `registered` acknowledgement
+                        # stays in the tool result.
+                        shown = ({key: presentation[key] for key in ("coachCard", "callbackScope", "context")
+                                  if key in presentation} if presentation is not None else {})
                         _publish_interactive({
                             "event": "message.interactive", "run_id": run_id,
                             "timestamp": time.time(), "message_id": message_id,
                             "message": message,
-                            "context": presentation.get("context") if registered is not None else context,
-                            **presentation,
+                            "context": shown.get("context") if presentation is not None else context,
+                            **shown,
                             **({"metadata": metadata} if metadata is not None else {}),
                         })
                     deliver_current = AcknowledgedPublisher(host_broker, _deliver_current) if publication_ack else _deliver_current
@@ -7711,6 +7735,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            from gateway.interactive_messages import load_workflow_skill_context
+                            workflow_notes = load_workflow_skill_context(
+                                interaction_context, getattr(agent, 'valid_tool_names', set()), effective_task_id)
+                            if workflow_notes:
+                                previous_notes = getattr(agent, '_gateway_turn_context_notes', '') or ''
+                                agent._gateway_turn_context_notes = '\n\n'.join(
+                                    note for note in (previous_notes, workflow_notes) if note)
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,

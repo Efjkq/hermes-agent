@@ -1439,6 +1439,13 @@ def init_agent(
     agent.valid_tool_names = set()
     if agent.tools:
         agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+        from tools.tool_search import load_config as load_tool_search_config
+        if load_tool_search_config().defer_core_tools:
+            # Skills and dispatch need the whole authorized catalog, including
+            # tools whose full schemas are disclosed through the existing bridge.
+            agent.valid_tool_names.update(tool['function']['name'] for tool in _ra().get_tool_definitions(
+                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+                quiet_mode=True, skip_tool_search_assembly=True))
         tool_names = sorted(agent.valid_tool_names)
         if not agent.quiet_mode:
             print(f"🛠️  Loaded {len(agent.tools)} tools: {', '.join(tool_names)}")
