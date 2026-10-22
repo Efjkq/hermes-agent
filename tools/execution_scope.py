@@ -45,3 +45,22 @@ def execution_scope_error(name: str):
     if allowed is not None and name not in allowed:
         return json.dumps({"error": "This proposal-only conversation cannot execute arbitrary tools. Prepare a host card for the user's separate review and confirmation.", "error_type": "proposal_only", "tool": name})
     return None
+
+# A versioned business-proxy manifest adds no native execution permission.
+# Owner tool configuration remains authoritative; unlike proposal scope this
+# scope only exposes explicitly bound proxy schemas.
+_bound_host_tools = ContextVar("bound_current_host_tools", default=frozenset())
+
+@contextmanager
+def host_tool_scope(names=()):
+    from tools.registry import registry
+    if any(registry.get_toolset_for_tool(name) != "api_host_tools" for name in names):
+        raise ValueError("Host tools must be registered proxies")
+    token = _bound_host_tools.set(frozenset(names))
+    try:
+        yield
+    finally:
+        _bound_host_tools.reset(token)
+
+def bound_host_tools():
+    return _bound_host_tools.get()

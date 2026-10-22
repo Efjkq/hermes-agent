@@ -334,7 +334,7 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    from tools.execution_scope import proposal_available_tools
+    from tools.execution_scope import proposal_available_tools, bound_host_tools
     scope_tools = proposal_available_tools()
     if scope_tools is not None:
         skip_tool_search_assembly = True
@@ -360,6 +360,7 @@ def get_tool_definitions(
                 _is_dispatcher_owned_worker(),
                 profile_scope,
                 scope_tools,
+                bound_host_tools(),
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
@@ -556,7 +557,7 @@ def _compute_tool_definitions(
                     }
                     break
 
-    from tools.execution_scope import proposal_available_tools
+    from tools.execution_scope import proposal_available_tools, bound_host_tools
     scope_tools = proposal_available_tools()
     if scope_tools is not None:
         filtered_tools = [tool for tool in filtered_tools if tool["function"]["name"] in scope_tools]
