@@ -65,3 +65,29 @@ def test_trusted_delivery_envelope_uses_original_message_id_without_model_copyin
     assert second['publication']['messageId']=='original-card'
     assert [item[1] for item in delivered]==['original-card','original-card']
     assert delivered[0][2]=={"preparedActions":["original-action"]}
+
+
+def test_v2_bound_proxy_skill_is_listed_and_readable_only_in_its_run(host_plugin, tmp_path, monkeypatch):
+    import tools.skills_tool as skills
+    monkeypatch.setenv("SKILL_SECURITY_GATE_ENABLED", "false")
+    monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path)
+    monkeypatch.setattr("agent.skill_utils.get_external_skills_dirs", lambda: [])
+    monkeypatch.setattr(skills, "_get_disabled_skill_names", lambda: set())
+    folder = tmp_path / "bound-task"
+    folder.mkdir()
+    content = ("---\nname: bound-task\ndescription: Read a bound business task.\n"
+               "metadata:\n  hermes:\n    requires_tools:\n      - " + host_plugin + "\n---\nUse the bound operation.\n")
+    (folder / "SKILL.md").write_text(content)
+    skills._SKILLS_CACHE.clear()
+    try:
+        assert not json.loads(skills.skill_view("bound-task"))["success"]
+        context = {"version": 2, "execution_policy": "pawpilot", "host_tools": [host_plugin]}
+        with current_message_scope(lambda *args: None, context):
+            listing = json.loads(skills.skills_list())
+            assert any(item["name"] == "bound-task" for item in listing["skills"]), listing
+            viewed = json.loads(skills.skill_view("bound-task"))
+            assert viewed["success"], viewed
+            assert viewed["content"] == content
+        assert not json.loads(skills.skill_view("bound-task"))["success"]
+    finally:
+        skills._SKILLS_CACHE.clear()
