@@ -694,8 +694,8 @@ class ToolRegistry:
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
-        from tools.execution_scope import proposal_available_tools
-        host_scope = proposal_available_tools()
+        from tools.execution_scope import proposal_available_tools, bound_host_tools
+        host_scope = (proposal_available_tools() or frozenset()) | bound_host_tools()
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
             if not entry:

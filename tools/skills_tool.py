@@ -914,19 +914,21 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _skill_available_in_current_scope(conditions: dict) -> bool:
-    from tools.execution_scope import proposal_available_tools, proposal_available_toolsets
+    from tools.execution_scope import bound_host_tools, proposal_available_tools, proposal_available_toolsets
     from agent.prompt_builder import _skill_should_show
 
     scope_tools = proposal_available_tools()
     if scope_tools is not None:
         return _skill_should_show(conditions, scope_tools, proposal_available_toolsets())
 
-    # Ordinary native calls retain their existing dependency semantics, but
-    # registered host proxies are unusable without a current Run binding.
+    # Native dependency semantics stay unchanged. A v2 Run can bind proxies
+    # without entering proposal-only scope, but unbound proxies stay hidden.
     from tools.registry import registry
-    return "api_host_tools" not in conditions.get("requires_toolsets", []) and not any(
-        registry.get_toolset_for_tool(name) == "api_host_tools"
+    bound = bound_host_tools()
+    return ("api_host_tools" not in conditions.get("requires_toolsets", []) or bool(bound)) and all(
+        name in bound
         for name in conditions.get("requires_tools", [])
+        if registry.get_toolset_for_tool(name) == "api_host_tools"
     )
 
 
