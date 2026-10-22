@@ -49,6 +49,24 @@ def test_v2_host_catalog_adds_only_bound_proxies_and_keeps_owner_tools(host_plug
         assert execution_scope_error('terminal') is None
     assert not registry.get_definitions({host_plugin},quiet=True)
 
+
+def test_bound_business_operations_and_current_delivery_need_no_discovery(host_plugin, monkeypatch):
+    from model_tools import get_tool_definitions
+    from tools.execution_scope import host_tool_scope
+    from tools.tool_search import ToolSearchConfig
+    monkeypatch.setattr('tools.tool_search.load_config', lambda: ToolSearchConfig.from_raw({'enabled': 'on'}))
+    enabled = ['api_host_tools', 'api_interactions', 'skills', 'terminal']
+    with host_tool_scope([host_plugin]):
+        definitions = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+    names = [tool['function']['name'] for tool in definitions]
+    assert {host_plugin, 'send_message', 'clarify', 'terminal'} <= set(names)
+    assert len(names) == len(set(names))
+    for tool in definitions:
+        if tool['function']['name'] in {'tool_search', 'tool_describe', 'tool_call'}:
+            assert host_plugin not in tool['function']['description']
+    unbound = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+    assert host_plugin not in {tool['function']['name'] for tool in unbound}
+
 def test_trusted_delivery_envelope_uses_original_message_id_without_model_copying():
     from gateway.host_tools import host_tool_scope, call_current_host_tool
     class Broker:
@@ -89,5 +107,51 @@ def test_v2_bound_proxy_skill_is_listed_and_readable_only_in_its_run(host_plugin
             assert viewed["success"], viewed
             assert viewed["content"] == content
         assert not json.loads(skills.skill_view("bound-task"))["success"]
+    finally:
+        skills._SKILLS_CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_api_loads_only_requested_workflow_from_native_loader_before_first_model_turn(host_plugin, tmp_path, monkeypatch):
+    import tools.skills_tool as skills
+    monkeypatch.setenv('SKILL_SECURITY_GATE_ENABLED', 'false')
+    monkeypatch.setattr(skills, 'SKILLS_DIR', tmp_path)
+    monkeypatch.setattr('agent.skill_utils.get_external_skills_dirs', lambda: [])
+    disabled = set()
+    monkeypatch.setattr('hermes_cli.config.load_config', lambda: {'skills': {'disabled': list(disabled)}})
+    folder = tmp_path / 'bound-workflow'
+    folder.mkdir()
+    content = '---\nname: bound-workflow\ndescription: Prepare a draft.\n---\nRead the original target. Draft only.'
+    (folder / 'SKILL.md').write_text(content)
+    skills._SKILLS_CACHE.clear()
+    agent = HostAgent()
+    inputs = []
+    agent.run_conversation = lambda **kwargs: inputs.append((kwargs['user_message'], getattr(agent, '_gateway_turn_context_notes', ''))) or {'final_response': 'done'}
+    adapter = _make_adapter('test-key')
+    headers = {'Authorization': 'Bearer test-key'}
+    body = {'input': 'Prepare ETH', 'interaction_context': {'version': 2, 'execution_policy': 'pawpilot', 'host_tools': [host_plugin], 'workflow_skills': ['bound-workflow']}}
+    try:
+        with patch.object(adapter, '_create_agent', return_value=agent):
+            async with TestClient(TestServer(_interactive_app(adapter))) as client:
+                response = await client.post('/v1/runs', headers=headers, json=body)
+                assert response.status == 202, await response.text()
+                await settle(adapter, (await response.json())['run_id'])
+                assert inputs[0][0] == 'Prepare ETH'
+                assert content in inputs[0][1]
+                assert 'already loaded' in inputs[0][1]
+                # User disable is honored by the same native loader, not a
+                # backend copy of the Skill. An ordinary turn still works.
+                disabled.add('bound-workflow')
+                response = await client.post('/v1/runs', headers=headers, json=body)
+                run_id = (await response.json())['run_id']
+                task = adapter._active_run_tasks.get(run_id)
+                if task is not None:
+                    await task
+                assert adapter._run_statuses[run_id]['status'] == 'failed'
+                assert len(inputs) == 1
+                response = await client.post('/v1/runs', headers=headers, json={'input': 'Hello'})
+                agent._gateway_turn_context_notes = ''
+                await settle(adapter, (await response.json())['run_id'])
+                assert inputs[-1][0] == 'Hello'
     finally:
         skills._SKILLS_CACHE.clear()

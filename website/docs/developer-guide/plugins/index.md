@@ -279,6 +279,48 @@ def register(ctx):
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 
+### Report API capability readiness
+
+Plugins can expose a small readiness receipt in authenticated `/v1/capabilities`
+without registering another model tool:
+
+```python
+def register(ctx):
+    ctx.register_api_capability("example_v1", lambda available_tools: {
+        "ready": "example_read" in available_tools,
+        "version": 1,
+    })
+```
+
+`available_tools` is the immutable set of host proxies currently available to the
+API server, not an authorization to execute them. The plugin owns its version and
+dependency checks; core Hermes only returns the JSON object under
+`features.plugin_capabilities.example_v1`. Probe the actual installed dependencies
+and user-disabled settings rather than inferring readiness from a transport version.
+Keep probes read-only and bounded. No model, business write or credential value
+belongs in a capability response. A result must be JSON serializable, at most
+32 KiB, with no non-finite numbers. Failed probes report `ready: false` and
+`reason: probe_unavailable`; disabled or unsuccessfully loaded plugins report
+nothing. Capability names are unique across plugins and are cleared on forced
+rediscovery. Existing tools and their original authorization remain unchanged.
+
+### Host workflow hints and publication references
+
+Version-2 API interaction contexts may include up to three unique
+`workflow_skills` names. For a known host action, Hermes reads these through the
+actual native Skill loader before the first model request, honoring installed
+assets and disabled settings. Loading does not run CLI preprocessing or grant
+shell permissions. Missing dependencies fail explicitly. The text is staged on
+the existing current-turn `api_content` sidecar; clean user history and the
+conversation's cached system prefix remain unchanged. The capabilities response
+advertises `workflow_skill_loading` only when this path is supported.
+
+Already-authorized bound host proxies and current-conversation delivery tools
+use the existing eager-tool configuration. Other owner tools retain their
+existing permissions and discovery path. Publication acknowledgements preserve
+the host's bounded `registered` resource references, including on duplicate
+delivery; consumers must use those original references rather than inventing IDs.
+
 **`dispatch_tool` example — a slash command that runs a tool:**
 
 ```python

@@ -51,6 +51,22 @@ def test_success_and_duplicate_share_registered_identity_and_one_visible_card():
     assert first.get("duplicate") or second.get("duplicate")
 
 
+def test_native_publication_returns_original_registered_resource_for_followup_save():
+    class RegisteredHost(Host):
+        def call(self, operation, payload):
+            result = super().call(operation, payload)
+            result['registered'] = {'coachCard': {'id': '72a71769-36a3-428d-a47c-00ebcddf85a6', 'kind': 'playbook_proposal', 'version': 1}}
+            return result
+    host, visible = RegisteredHost(), []
+    with current_message_scope(AcknowledgedPublisher(host, lambda *args: visible.append(args))):
+        first = send_current_message('Your preferences', metadata=CARD)
+        retried = send_current_message('Your preferences', metadata=CARD)
+    assert first['registered']['coachCard']['id'] == '72a71769-36a3-428d-a47c-00ebcddf85a6'
+    assert first['registered'] == retried['registered']
+    assert first['registered']['coachCard']['id'] != first['message_id']
+    assert len(host.calls) == len(visible) == 1
+
+
 def test_unknown_registration_retries_original_message_and_rejection_stays_failed():
     host, visible = Host(), []
     host.failures = [{"status": "error", "error": {"code": "HOST_CALL_UNKNOWN"}, "callId": "original-call"}]

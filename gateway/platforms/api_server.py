@@ -2956,11 +2956,8 @@ class APIServerAdapter(BasePlatformAdapter):
         with host_tool_scope(host_tool_names if bound_business_tools else ()), proposal_only_scope(proposal_only, host_tools=host_tool_names, available_tools=allowed):
             agent = AIAgent(**agent_kwargs)
         if bound_business_tools:
-            from tools.registry import registry
-            with host_tool_scope(host_tool_names):
-                proxies = registry.get_definitions(set(host_tool_names), quiet=True)
-            agent.tools = [tool for tool in agent.tools if tool["function"]["name"] not in host_tool_names] + proxies
-            agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+            # Native assembly already keeps bound proxies/current delivery eager
+            # and sanitized. Do not append a second unsanitized catalog here.
             agent._skip_mcp_refresh = True
         if proposal_only:
             from tools.execution_scope import PROPOSAL_ONLY_TOOL_NAMES
@@ -3722,6 +3719,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from hermes_cli.plugins import get_plugin_manager
+        plugin_capabilities = get_plugin_manager().api_capabilities(set(self._available_host_tools()))
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -3762,6 +3762,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "live_proposal_only": True,
                 "host_tools_v1": True,
                 "pawpilot_runtime_v2": True,
+                "workflow_skill_loading": True,
+                "plugin_capabilities": plugin_capabilities,
                 "publication_ack_v1": bool(self._expected_api_key()),
                 "host_tool_names": self._available_host_tools(),
                 "run_clarify_response": True,
@@ -7610,6 +7612,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            from gateway.interactive_messages import load_workflow_skill_context
+                            workflow_notes = load_workflow_skill_context(
+                                interaction_context, getattr(agent, 'valid_tool_names', set()), effective_task_id)
+                            if workflow_notes:
+                                previous_notes = getattr(agent, '_gateway_turn_context_notes', '') or ''
+                                agent._gateway_turn_context_notes = '\n\n'.join(
+                                    note for note in (previous_notes, workflow_notes) if note)
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,

@@ -349,6 +349,18 @@ class PluginContext:
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
 
+    def register_api_capability(self, name: str, probe: Callable) -> None:
+        """Report a plugin's actual API readiness; this grants no tools or permissions."""
+        if not isinstance(name, str) or not name or len(name) > 64 or not all(
+            c.isascii() and (c.isalnum() or c == "_") for c in name
+        ) or not callable(probe):
+            raise ValueError("Invalid API capability registration")
+        owner = self.manifest.key or self.manifest.name
+        existing = self._manager._api_capabilities.get(name)
+        if existing and existing[0] != owner:
+            raise ValueError("API capability already registered")
+        self._manager._api_capabilities[name] = (owner, probe)
+
     # -- host-owned LLM access ----------------------------------------------
 
     @property
@@ -1293,6 +1305,8 @@ class PluginManager:
 
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
+
+        self._api_capabilities: Dict[str, tuple[str, Callable]] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
@@ -1334,6 +1348,7 @@ class PluginManager:
             return
         if force:
             self._plugins.clear()
+            self._api_capabilities.clear()
             self._hooks.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
@@ -1931,6 +1946,27 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Hook invocation
     # -----------------------------------------------------------------------
+
+    def api_capabilities(self, available_tools: Set[str]) -> Dict[str, dict]:
+        """Probe only successfully loaded plugins; do not leak failure details."""
+        import json
+
+        results = {}
+        for name, (owner, probe) in self._api_capabilities.items():
+            loaded = self._plugins.get(owner)
+            if not loaded or not loaded.enabled:
+                continue
+            try:
+                value = probe(frozenset(available_tools))
+                if not isinstance(value, dict):
+                    raise ValueError("API capability must be an object")
+                encoded = json.dumps(value, allow_nan=False)
+                if len(encoded.encode("utf-8")) > 32768:
+                    raise ValueError("API capability exceeds response budget")
+                results[name] = json.loads(encoded)
+            except Exception:
+                results[name] = {"ready": False, "reason": "probe_unavailable"}
+        return results
 
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.

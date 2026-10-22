@@ -597,6 +597,16 @@ def _compute_tool_definitions(
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
+        if bound_host_tools():
+            from dataclasses import replace
+            # These are already authorized and required by this Run's workflow.
+            # Keep their normal sanitized schemas eager instead of making the
+            # model search/describe/call them through another bridge. Other
+            # owner tools retain their configured disclosure and permissions.
+            ts_cfg = replace(ts_cfg, always_visible_tools=(
+                ts_cfg.always_visible_tools | bound_host_tools()
+                | ({'send_message', 'clarify'} & available_tool_names)
+            ))
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(

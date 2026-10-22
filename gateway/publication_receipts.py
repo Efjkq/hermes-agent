@@ -87,6 +87,12 @@ class AcknowledgedPublisher:
                     registration = Registration.model_validate(result.get("publication"))
                     if result.get("status") != "ready" or registration.messageId != message_id:
                         raise ValueError("Mismatched registration")
+                    registered = result.get('registered', {})
+                    if not isinstance(registered, dict):
+                        raise ValueError('Invalid registered resources')
+                    encoded = json.dumps(registered, allow_nan=False, ensure_ascii=False)
+                    if len(encoded.encode('utf-8')) > 32768:
+                        raise ValueError('Registered resources too large')
                 except (ValueError, TypeError):
                     error = result.get("error") or {}
                     reason = result.get("reason") or (error.get("code") if isinstance(error, dict) else None)
@@ -104,6 +110,9 @@ class AcknowledgedPublisher:
                         entry["rejected"] = failed
                     return deepcopy(failed)
                 entry["registration"] = registration.model_dump(mode="json")
+                # Opaque, bounded host acknowledgement (not model metadata).
+                # Follow-up operations need its original resource identities.
+                entry['registered'] = json.loads(encoded)
             receipt = deepcopy(entry["registration"])
             try:
                 self._deliver(message, message_id, context, metadata)
@@ -112,6 +121,8 @@ class AcknowledgedPublisher:
                         "error": "CURRENT_MESSAGE_DELIVERY_UNKNOWN", "publication": receipt,
                         "retrySameInput": True}
             delivered = {"success": True, "message_id": message_id, "publication": receipt}
+            if entry.get('registered'):
+                delivered['registered'] = deepcopy(entry['registered'])
             if structured:
                 entry["delivered"] = delivered
             else:

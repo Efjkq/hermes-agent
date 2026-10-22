@@ -59,10 +59,14 @@ class InteractionContext(BaseModel):
     host_data: Optional[dict] = None
     host_tools: list[str] = Field(default_factory=list, max_length=8)
     serial_host_tools: list[str] = Field(default_factory=list, max_length=8)
+    workflow_skills: list[str] = Field(default_factory=list, max_length=3)
     execution_policy: Optional[Literal["proposal_only", "pawpilot"]] = None
 
     @model_validator(mode="after")
     def bounded_host_data(self):
+        if self.workflow_skills and (self.version != 2 or len(set(self.workflow_skills)) != len(self.workflow_skills)
+                                     or any(not 1 <= len(name) <= 128 for name in self.workflow_skills)):
+            raise ValueError('Workflow skills require a bounded unique version-2 list')
         if self.version == 1 and (self.mode is None or self.account_id is None or self.execution_policy == "pawpilot"):
             raise ValueError("Legacy interaction requires its original account scope")
         if self.version == 2 and (self.execution_policy != "pawpilot" or self.mode is not None or self.account_id is not None or self.market_key is not None):
@@ -112,6 +116,35 @@ def current_interaction_context() -> Optional[dict]:
     return deepcopy(_context.get())
 
 
+def load_workflow_skill_context(context: Optional[dict], available_tools, task_id: str) -> str:
+    """Read explicit workflow hints through the real loader, without a model round.
+
+    The caller stages these on the existing current-turn api_content sidecar.
+    Neither the cached system prefix nor the clean stored user text changes.
+    No CLI preprocessing, shell permission or financial operation is implied.
+    """
+    names = (context or {}).get('workflow_skills', ())
+    if not names:
+        return ''
+    if 'skill_view' not in available_tools:
+        raise RuntimeError('Workflow skill loader unavailable')
+    from tools.skills_tool import skill_view
+    blocks = []
+    for name in names:
+        result = json.loads(skill_view(name, task_id=task_id, preprocess=False))
+        content = result.get('content')
+        if result.get('success') is not True or not isinstance(content, str) or not content:
+            raise RuntimeError(f'Workflow skill unavailable: {name}')
+        blocks.append(f'## Installed workflow: {name}\n{content}')
+    notes = ('[The following installed workflow Skills are already loaded for this request. '
+             'Use them when relevant without re-reading their main files. The user message '
+             'determines intent; a workflow hint never overrides an explicit user choice.]\n\n'
+             + '\n\n'.join(blocks))
+    if len(notes.encode('utf-8')) > 65536:
+        raise RuntimeError('Workflow skill context too large')
+    return notes
+
+
 def send_current_message(text: str, reply_markup=None, metadata=None, *, _message_id=None) -> dict:
     if not isinstance(text, str) or not text.strip() or len(text) > 4096:
         return {"error": "Current conversation message must contain 1–4096 characters"}
@@ -152,7 +185,7 @@ def send_current_message(text: str, reply_markup=None, metadata=None, *, _messag
     except Exception:
         return {"error": "Current conversation delivery is unavailable; no other channel was used"}
     return {"success": True, "message_id": message_id, "message": message,
-            **({key: receipt[key] for key in ("publication", "duplicate") if key in receipt}
+            **({key: receipt[key] for key in ("publication", "registered", "duplicate") if key in receipt}
                if isinstance(receipt, dict) else {}),
             **({"metadata": metadata} if metadata is not None else {}),
             **({"context": current_interaction_context()} if _context.get() is not None else {})}
