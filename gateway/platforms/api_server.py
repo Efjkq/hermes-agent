@@ -7244,7 +7244,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
-    @_admit_api_agent_request
     async def _handle_run_lookup(self, request: "web.Request") -> "web.Response":
         """Recover a native run ID under the same profile/bearer scope as submit."""
         auth_err = self._check_auth(request)
@@ -7265,6 +7264,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Content-free recovery: do not expose a saved input/output/fingerprint.
         return web.json_response({"run_id": run_id, "status": status["status"]})
 
+    @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         # Long-term memory scope header (see chat_completions for details).
