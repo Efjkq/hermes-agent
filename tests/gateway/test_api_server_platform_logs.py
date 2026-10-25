@@ -3,7 +3,34 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
+from gateway.platform_logs import read_gateway_log
 from gateway.platforms.api_server import APIServerAdapter
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "expected_lines"),
+    [
+        (10, ["two", "three"]),
+        (9, ["three"]),
+        (14, ["one", "two", "three"]),
+        (6, ["three"]),
+    ],
+    ids=["line-boundary", "inside-line", "file-start", "single-complete-line"],
+)
+def test_initial_tail_preserves_complete_lines_at_window_boundary(tmp_path, max_bytes, expected_lines):
+    log = tmp_path / "logs" / "gateway.log"
+    log.parent.mkdir()
+    log.write_bytes(b"one\ntwo\nthree\n")
+
+    first = read_gateway_log(tmp_path, {"maxBytes": max_bytes})
+    assert first["lines"] == expected_lines
+    assert first["cursor"]["offset"] == log.stat().st_size
+
+    with log.open("ab") as stream:
+        stream.write(b"four\n")
+    followed = read_gateway_log(tmp_path, {"maxBytes": max_bytes, "cursor": first["cursor"]})
+    assert followed["lines"] == ["four"]
+    assert followed["cursor"]["offset"] == log.stat().st_size
 
 
 @pytest.mark.asyncio

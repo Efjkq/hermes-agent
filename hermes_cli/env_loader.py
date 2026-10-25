@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import codecs
 import io
-import json
-import re
 import os
 import sys
 import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
+from hermes_cli.env_format import literal_env_values_enabled, parse_literal_env
 from utils import atomic_replace, fast_safe_load
 
 
@@ -93,6 +92,11 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     and blank lines.  Non-ASCII encoding errors fall back to ``latin-1``,
     matching ``_load_dotenv_with_fallback``.
     """
+    if literal_env_values_enabled():
+        try:
+            return set(parse_literal_env(path.read_text(encoding="utf-8-sig")))
+        except (OSError, UnicodeDecodeError):
+            return set()
     keys: set[str] = set()
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -311,7 +315,7 @@ def _sanitize_loaded_credentials() -> None:
     """
     # Hosted confidential values are opaque UTF-8 bytes. Rewriting them
     # would change the credential after the supervisor authenticated it.
-    if os.environ.get("HERMES_ENV_LITERAL_VALUES") == "1":
+    if literal_env_values_enabled():
         return
     for key, value in list(os.environ.items()):
         if not any(key.endswith(suffix) for suffix in _CREDENTIAL_SUFFIXES):
@@ -346,22 +350,8 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
-    if os.environ.get("HERMES_ENV_LITERAL_VALUES") == "1":
-        # Managed confidential bundles encode opaque settings as JSON strings.
-        # Decode exactly once; dotenv interpolation/escape rewriting cannot
-        # preserve all authenticated UTF-8 values (for example \u0001).
-        values = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
-            if match is None:
-                raise ValueError("Malformed literal environment assignment")
-            key, raw = match.groups()
-            value = json.loads(raw) if raw.startswith('"') else raw
-            if not isinstance(value, str) or "\0" in value:
-                raise ValueError("Invalid literal environment value")
-            values[key] = value
+    if literal_env_values_enabled():
+        values = parse_literal_env(path.read_text(encoding="utf-8-sig"))
         for key, value in values.items():
             if override or key not in os.environ:
                 os.environ[key] = value
@@ -394,7 +384,9 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     ``hermes_cli.config._sanitize_env_lines`` normalizes line endings while
     treating content after the first ``=`` as opaque for boundary discovery.
     """
-    if not path.exists():
+    # Literal bundles are authenticated opaque data. Their decoder validates
+    # values; generic dotenv repairs must not silently edit them first.
+    if literal_env_values_enabled() or not path.exists():
         return
     try:
         from hermes_cli.config import _sanitize_env_lines

@@ -41,7 +41,7 @@ class Host:
 
 def test_success_and_duplicate_share_registered_identity_and_one_visible_card():
     host, visible = Host(), []
-    publisher = AcknowledgedPublisher(host, lambda *args: visible.append(args))
+    publisher = AcknowledgedPublisher(host, lambda *args, **kwargs: visible.append(args))
     def send():
         with current_message_scope(publisher):
             return send_current_message("Try Paper", metadata=CARD)
@@ -69,6 +69,35 @@ def test_native_publication_returns_original_registered_resource_for_followup_sa
     assert first['registered'] == retried['registered']
     assert first['registered']['coachCard']['id'] != first['message_id']
     assert len(host.calls) == len(visible) == 1
+
+
+@pytest.mark.parametrize("include_registered", [False, True], ids=["omitted", "empty"])
+def test_legacy_registration_without_context_never_reuses_run_context(include_registered):
+    class LegacyHost(Host):
+        def call(self, operation, payload):
+            result = super().call(operation, payload)
+            if include_registered:
+                result["registered"] = {}
+            return result
+
+    host, presentations = LegacyHost(), []
+
+    def deliver(*args, **kwargs):
+        presentations.append(kwargs.get("presentation"))
+
+    run_context = {"version": 2, "execution_policy": "pawpilot", "host_data": {"page": "original"}}
+    with current_message_scope(AcknowledgedPublisher(host, deliver), run_context):
+        first = send_current_message("Registered reply", metadata=CARD)
+        duplicate = send_current_message("Registered reply", metadata=CARD)
+
+    assert first["success"] is True
+    assert first["publication"]["status"] == "registered"
+    assert first["context"] is None
+    assert presentations == [{"context": None}]
+    assert duplicate["success"] is True and duplicate["duplicate"] is True
+    assert duplicate["context"] is None
+    assert duplicate["message_id"] == first["message_id"]
+    assert len(host.calls) == 1
 
 
 @pytest.mark.parametrize('registered_context', [True, False])
@@ -108,7 +137,7 @@ def test_registered_acknowledgement_round_trips_beside_presented_card_scope_and_
 def test_unknown_registration_retries_original_message_and_rejection_stays_failed():
     host, visible = Host(), []
     host.failures = [{"status": "error", "error": {"code": "HOST_CALL_UNKNOWN"}, "callId": "original-call"}]
-    publisher = AcknowledgedPublisher(host, lambda *args: visible.append(args))
+    publisher = AcknowledgedPublisher(host, lambda *args, **kwargs: visible.append(args))
     with current_message_scope(publisher):
         unknown = send_current_message("Try Paper", metadata=CARD)
         assert unknown["error"] == "HOST_CALL_UNKNOWN" and not visible
@@ -127,7 +156,7 @@ def test_unknown_registration_retries_original_message_and_rejection_stays_faile
 
 def test_registered_but_unseen_retries_delivery_without_registration_or_new_identity():
     host, visible = Host(), []
-    def deliver(*args):
+    def deliver(*args, **kwargs):
         if not visible:
             visible.append("lost")
             raise TimeoutError()
@@ -145,7 +174,7 @@ def test_registered_but_unseen_retries_delivery_without_registration_or_new_iden
 def test_separate_runs_and_plain_repeated_text_have_distinct_publications():
     visible, host = [], Host()
     for _ in range(2):
-        publisher = AcknowledgedPublisher(host, lambda *args: visible.append(args))
+        publisher = AcknowledgedPublisher(host, lambda *args, **kwargs: visible.append(args))
         with current_message_scope(publisher):
             send_current_message("Try Paper", metadata=CARD)
             send_current_message("Hello")
@@ -167,7 +196,7 @@ def test_mismatched_or_missing_ack_cannot_publish():
 
 def test_unknown_plain_delivery_recovers_identity_before_allowing_new_repeated_text():
     host, attempts = Host(), []
-    def deliver(*args):
+    def deliver(*args, **kwargs):
         attempts.append(args)
         if len(attempts) == 1:
             raise TimeoutError()

@@ -1465,6 +1465,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Durable reservations and bounded, replayable run event streams.
         self._run_idempotency_store = RunIdempotencyStore()
+        self._fallback_pairing_stores = {}
         self._run_idempotency_ids: set[str] = set()
         self._run_owners: Dict[str, str] = {}
         self._run_host_tools: Dict[str, Any] = {}
@@ -3084,13 +3085,40 @@ class APIServerAdapter(BasePlatformAdapter):
             return f"{pid}:unknown"
 
     def _platform_pairing_store(self):
+        """Resolve control operations to the store used by this profile's authz."""
         runner = getattr(self, "gateway_runner", None)
-        store = getattr(runner, "pairing_store", None)
+        profile = _api_request_profile.get()
+        stores = getattr(runner, "pairing_stores", None)
+        store = (
+            (stores or {}).get(profile)
+            if profile is not None
+            else getattr(runner, "pairing_store", None)
+        )
         if store is not None:
             return store
         from gateway.pairing import PairingStore
 
-        return PairingStore()
+        primary = getattr(runner, "pairing_store", None)
+        primary_home = getattr(primary, "home", None)
+        if profile is not None and primary_home is not None:
+            from hermes_cli.profiles import get_profile_dir
+
+            # The profile map is populated after adapter startup. Reuse the
+            # primary store's lock during that window only if its home matches;
+            # request-local profile helpers cannot identify the process owner.
+            if Path(primary_home).resolve() == get_profile_dir(profile).resolve():
+                store = primary
+        # Reuse the lock when no runner store has been attached yet. A named
+        # profile must never fall back to the default profile's grant file.
+        if store is None:
+            if profile not in self._fallback_pairing_stores:
+                self._fallback_pairing_stores[profile] = PairingStore(profile=profile)
+            store = self._fallback_pairing_stores[profile]
+        if profile is not None and runner is not None:
+            if stores is None:
+                stores = runner.pairing_stores = {}
+            stores[profile] = store
+        return store
 
     @staticmethod
     def _platform_runtime_target(filename: str) -> tuple[Path, int]:
@@ -3558,26 +3586,25 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error("Unknown pairing operation"), status=404)
         store = self._platform_pairing_store()
-        # The gateway's one store lock fences concurrent adapter approvals.
-        with store._lock:
-            if operation == "approve":
-                try:
-                    result = store.approve_code(channel, body["code"])
-                except Exception:
-                    # The grant may already be durable before a mirror update
-                    # fails. The controller must reconcile, never infer refusal.
-                    return web.json_response({"status": "incomplete"})
+        if operation == "approve":
+            try:
+                result = await asyncio.to_thread(store.approve_code, channel, body["code"])
                 if result is None:
                     return web.json_response({"status": "not_found"})
-            elif operation == "revoke":
-                removed = 0
-                if mode == "entry":
-                    removed = int(store.revoke(channel, body["entry"]))
-                elif mode == "account":
-                    for user in store.list_approved(channel):
-                        removed += int(store.revoke(channel, user["user_id"]))
-                pending = store.clear_pending(channel, body.get("entry") if mode == "entry" else None)
-            allow_from = [user["user_id"] for user in store.list_approved(channel)]
+                approved = await asyncio.to_thread(store.list_approved, channel)
+            except Exception:
+                # The grant may already be durable before a mirror update
+                # fails. The controller must reconcile, never infer refusal.
+                return web.json_response({"status": "incomplete"})
+        elif operation == "revoke":
+            removed, pending, approved = await asyncio.to_thread(
+                store.revoke_pairings, channel,
+                body.get("entry") if mode == "entry" else None,
+                pending_only=(mode == "requests"),
+            )
+        else:
+            approved = await asyncio.to_thread(store.list_approved, channel)
+        allow_from = [user["user_id"] for user in approved]
         if operation == "revoke":
             return web.json_response({"changed": bool(removed or pending), "removedAllowFromCount": removed,
                                       "removedRequestCount": pending, "allowFrom": allow_from})
@@ -3596,14 +3623,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({
                 "ok": True,
                 "platform": "telegram",
-                "users": store.list_approved("telegram"),
+                "users": await asyncio.to_thread(store.list_approved, "telegram"),
             })
 
         body, err = await self._read_json_body(request)
         if err:
             return err
         try:
-            users = store.replace_approved("telegram", self._approved_users_from_body(body))
+            users = await asyncio.to_thread(
+                store.replace_approved, "telegram", self._approved_users_from_body(body)
+            )
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception:
@@ -7082,11 +7111,8 @@ class APIServerAdapter(BasePlatformAdapter):
         identity = self._expected_api_key() or "unauthenticated-test-listener"
         return hashlib.sha256(f"{profile}\0{identity}".encode()).hexdigest()
 
-    def _durable_run_status(self, request, run_id):
-        scope = self._run_idempotency_scope(request)
-        owner = self._run_owners.get(run_id)
-        if owner is not None and owner != scope:
-            return None
+    def _local_run_status(self, run_id):
+        """Return authoritative local state, excluding another worker's snapshot."""
         status = self._run_statuses.get(run_id)
         if status is not None and (
             run_id in self._active_run_tasks
@@ -7094,6 +7120,10 @@ class APIServerAdapter(BasePlatformAdapter):
             or status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
         ):
             return status
+        return None
+
+    def _load_durable_run_status(self, scope, run_id):
+        """Read and reconcile storage without accessing event-loop-owned caches."""
         # A status hydrated from another worker is only a snapshot. Refresh it
         # until terminal so completion and owner death cannot stay cached away.
         record = self._run_idempotency_store.status_for_run(scope, run_id)
@@ -7111,10 +7141,44 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if status is None:
                 return None
-        self._run_statuses[run_id] = status
-        self._run_owners[run_id] = scope
-        self._run_idempotency_ids.add(run_id)
         return status
+
+    def _cache_durable_run_status(self, scope, run_id, status):
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        # A local run may have completed while a durable read was in flight.
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        if status is not None:
+            self._run_statuses[run_id] = status
+            self._run_owners[run_id] = scope
+            self._run_idempotency_ids.add(run_id)
+        return status
+
+    def _durable_run_status(self, request, run_id):
+        scope = self._run_idempotency_scope(request)
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        return self._cache_durable_run_status(
+            scope, run_id, self._load_durable_run_status(scope, run_id)
+        )
+
+    async def _durable_run_status_async(self, request, run_id):
+        scope = self._run_idempotency_scope(request)
+        owner = self._run_owners.get(run_id)
+        if owner is not None and owner != scope:
+            return None
+        local = self._local_run_status(run_id)
+        if local is not None:
+            return local
+        status = await asyncio.to_thread(self._load_durable_run_status, scope, run_id)
+        return self._cache_durable_run_status(scope, run_id, status)
 
     def _run_replay_response(self, request, outcome, record, gateway_session_key):
         if outcome == "conflict":
@@ -7257,8 +7321,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 or not key or len(key) > 255
                 or any(ord(ch) < 33 or ord(ch) > 126 for ch in key)):
             return web.json_response(_openai_error("Invalid idempotency key", code="invalid_idempotency_key"), status=400)
-        run_id = self._run_idempotency_store.run_for_key(self._run_idempotency_scope(request), key)
-        status = self._durable_run_status(request, run_id) if run_id else None
+        run_id = await asyncio.to_thread(
+            self._run_idempotency_store.run_for_key,
+            self._run_idempotency_scope(request), key,
+        )
+        status = await self._durable_run_status_async(request, run_id) if run_id else None
         if status is None:
             return web.json_response(_openai_error("Run not found", code="run_not_found"), status=404)
         # Content-free recovery: do not expose a saved input/output/fingerprint.

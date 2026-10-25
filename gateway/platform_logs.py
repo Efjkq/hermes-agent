@@ -33,13 +33,19 @@ def read_gateway_log(home: Path, body: dict) -> dict:
         same_file = cursor and cursor["dev"] == info.st_dev and cursor["ino"] == info.st_ino
         start = max(0, info.st_size - cap) if initial else (
             cursor["offset"] if same_file and cursor["offset"] <= info.st_size else 0)
+        skip_partial_line = False
+        if initial and start > 0:
+            # The first line is complete when the bounded window starts just
+            # after a newline. Probe its preceding byte before discarding it.
+            source.seek(start - 1)
+            skip_partial_line = source.read(1) != b"\n"
         source.seek(start)
         data = source.read(cap)
         complete = data.rfind(b"\n") + 1
         # A line exceeding the read cap cannot stall following forever.
         consumed = complete or (len(data) if len(data) == cap else 0)
         lines = data[:complete].split(b"\n")[:-1]
-        if initial and start > 0:
+        if skip_partial_line:
             lines = lines[1:]
         if initial:
             lines = lines[-limit:]
